@@ -57,3 +57,9 @@ curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/m
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-base-environment.sh" | bash
 ```
+
+该脚本用于配置面向全栈开发的基础环境：安装 mise、同步仓库约定的全局配置，并安装配置中声明的工具。工具清单、版本和安装后处理均以基础开发环境模板为准。
+
+基础开发环境默认配置会同步到 mise 全局 `conf.d/base-development-environment.toml`，不会覆盖用户已有的 `config.toml` 或其他全局配置。用户如需调整默认版本，应在自己的 `config.toml` 中覆盖对应配置。
+
+脚本结束后会根据当前 Shell 提示加载对应配置文件，例如 `source ~/.zshrc` 或 `source ~/.bashrc`；也可以重新打开终端后再使用 mise 和上述工具。

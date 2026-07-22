@@ -1,0 +1,14 @@
+[tools]
+bun = "latest"
+deno = "latest"
+java = "21"
+node = "lts"
+"npm:nrm" = "latest"
+rust = "stable"
+uv = "latest"
+
+[hooks]
+postinstall = "npx corepack enable"
+
+[settings]
+experimental = true

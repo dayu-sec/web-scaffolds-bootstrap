@@ -2,6 +2,12 @@
 
 set -Eeuo pipefail
 
+readonly GITHUB_REPOSITORY="dayu-sec/web-scaffolds-bootstrap"
+readonly GITHUB_BRANCH="main"
+readonly TEMPLATE_RELATIVE_PATH="templates/base-development-environment.toml"
+readonly TEMPLATE_DOWNLOAD_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_BRANCH}/${TEMPLATE_RELATIVE_PATH}"
+readonly MANAGED_CONFIG_FILENAME="base-development-environment.toml"
+
 ASSUME_YES=false
 REQUESTED_SHELL=""
 ACTIVE_SHELL=""
@@ -9,10 +15,11 @@ ACTIVE_SHELL_PATH=""
 MISE_BIN=""
 INSTALLER_TEMP_FILE=""
 ISOLATED_WORK_DIRECTORY=""
+TEMPLATE_SOURCE_FILE=""
+MANAGED_CONFIG_TEMP_FILE=""
+MANAGED_MISE_CONFIG_FILE=""
 INTERACTIVE_TERMINAL_OPEN=false
 CONFLICT_TOOLS=""
-NODE_VERSION=""
-PNPM_VERSION=""
 
 # 安装概览由 help 和交互引导共同使用，避免检查范围的文案在两处发生偏差。
 print_installation_overview() {
@@ -20,7 +27,9 @@ print_installation_overview() {
 安装内容：
   1. 检查并安装 mise
   2. 为当前登录 Shell 配置 mise 激活脚本
-  3. 检查并提示更新全局 Node.js LTS 和 pnpm latest
+  3. 同步基础开发环境模板到 mise 全局 conf.d 配置
+  4. 安装或更新 bun、deno、Java 21、Node.js LTS、nrm、Rust stable 和 uv
+  5. 通过 Corepack 启用由项目 packageManager 约束版本的 pnpm
 EOF
 }
 
@@ -29,6 +38,7 @@ print_conflict_notice() {
   cat <<'EOF'
 说明：
   脚本会检查 nvm、fnm、Volta、asdf、nodenv 和 n 等相似工具，但不会自动卸载。
+  基础开发环境模板作为全局默认配置写入 mise conf.d，不会覆盖用户的 config.toml。
 EOF
 }
 
@@ -43,7 +53,7 @@ EOF
 
 选项：
   --shell <bash|zsh|fish>  指定要配置的 Shell；默认从 SHELL 环境变量侦测
-  -y, --yes               非交互执行，自动确认安装、环境冲突和全局版本覆盖提示
+  -y, --yes               非交互执行，自动确认 mise 安装和环境冲突提示
   -h, --help              显示帮助
 
 EOF
@@ -61,6 +71,7 @@ fail() {
 
 cleanup() {
   [[ -z "$INSTALLER_TEMP_FILE" || ! -e "$INSTALLER_TEMP_FILE" ]] || rm -f "$INSTALLER_TEMP_FILE"
+  [[ -z "$MANAGED_CONFIG_TEMP_FILE" || ! -e "$MANAGED_CONFIG_TEMP_FILE" ]] || rm -f "$MANAGED_CONFIG_TEMP_FILE"
   # 工作目录只使用本次 mktemp 返回的精确路径，异常退出时也不遗留临时状态。
   [[ -z "$ISOLATED_WORK_DIRECTORY" || ! -d "$ISOLATED_WORK_DIRECTORY" ]] || rm -rf -- "$ISOLATED_WORK_DIRECTORY"
   if [[ "$INTERACTIVE_TERMINAL_OPEN" == true ]]; then
@@ -246,6 +257,18 @@ find_mise() {
   fi
 }
 
+# npm backend 安装与 reshim 可能从子进程再次调用 mise，因此不能只依赖绝对路径执行入口。
+ensure_mise_on_path() {
+  local mise_bin_directory=""
+
+  mise_bin_directory="$(dirname "$MISE_BIN")"
+  case ":$PATH:" in
+    *":${mise_bin_directory}:"*) ;;
+    *) PATH="${mise_bin_directory}:${PATH}" ;;
+  esac
+  export PATH
+}
+
 install_mise() {
   local temp_root="${TMPDIR:-/tmp}"
 
@@ -305,90 +328,6 @@ configure_shell_activation() {
   printf '已写入 mise %s 激活配置：%s\n' "$ACTIVE_SHELL" "$config_file"
 }
 
-# 已安装任意全局版本时先交给用户决定，避免静默改动现有工具链。
-confirm_global_tool_update() {
-  local display_name="$1"
-  local current_version="$2"
-  local version_spec="$3"
-  local answer=""
-
-  [[ "$ASSUME_YES" == true ]] && return 0
-
-  while true; do
-    printf 'mise 全局 %s 当前版本为 %s，是否按 %s 覆盖/更新？[Y/n]\n> ' \
-      "$display_name" "$current_version" "$version_spec" >&3
-    IFS= read -r answer <&3 || fail "未能读取用户输入。"
-    case "$answer" in
-      "" | y | Y | yes | YES)
-        return 0
-        ;;
-      n | N | no | NO)
-        return 1
-        ;;
-      *)
-        printf '请输入 Y 或 n，直接回车默认覆盖/更新。\n' >&3
-        ;;
-    esac
-  done
-}
-
-ensure_global_tool() {
-  local tool="$1"
-  local version_spec="$2"
-  local display_name="$3"
-  local current_version=""
-
-  # 中性目录结合全局来源和已安装状态筛选，避免项目配置或仅声明未安装的版本造成误判。
-  current_version="$({
-    cd "$ISOLATED_WORK_DIRECTORY"
-    "$MISE_BIN" ls --global --installed --no-header "$tool"
-  } 2>/dev/null || true)"
-  current_version="$(printf '%s\n' "$current_version" | awk -v expected_tool="$tool" '$1 == expected_tool { print $2; exit }')"
-
-  if [[ -n "$current_version" ]]; then
-    if ! confirm_global_tool_update "$display_name" "$current_version" "$version_spec"; then
-      printf '保留 mise 全局 %s 当前版本：%s。\n' "$display_name" "$current_version"
-      return
-    fi
-
-    printf '正在按 %s 覆盖/更新 mise 全局 %s（当前版本：%s）...\n' \
-      "$version_spec" "$display_name" "$current_version"
-  else
-    printf 'mise 全局未安装 %s，正在安装 %s...\n' "$display_name" "$version_spec"
-  fi
-
-  (
-    cd "$ISOLATED_WORK_DIRECTORY"
-    "$MISE_BIN" use --global "$tool@$version_spec"
-  )
-}
-
-# 安装或保留版本后都实际启动工具，确保 mise 全局配置不是仅声明但不可运行。
-verify_global_tool() {
-  local tool="$1"
-  local display_name="$2"
-  local command_output=""
-  local runtime_version=""
-
-  if ! command_output="$({
-    cd "$ISOLATED_WORK_DIRECTORY"
-    "$MISE_BIN" exec -- "$tool" --version
-  } 2>&1)"; then
-    fail "${display_name} 可运行性检查失败：${command_output}"
-  fi
-
-  runtime_version="$(printf '%s\n' "$command_output" | awk '/^v?[0-9]+\.[0-9]+(\.[0-9]+)?/ { print; exit }')"
-  [[ -n "$runtime_version" ]] || fail "${display_name} 已执行但未返回可识别的版本：${command_output}"
-
-  case "$tool" in
-    node) NODE_VERSION="$runtime_version" ;;
-    pnpm) PNPM_VERSION="$runtime_version" ;;
-    *) fail "没有为 ${tool} 配置版本记录位置。" ;;
-  esac
-
-  printf 'mise 全局 %s 可运行：%s\n' "$display_name" "$runtime_version"
-}
-
 # 创建本次环境配置专用的中性目录，隔离调用位置中的 mise.toml 和 npm 配置。
 prepare_isolated_work_directory() {
   local temp_root="${TMPDIR:-/tmp}"
@@ -397,14 +336,78 @@ prepare_isolated_work_directory() {
     fail "无法创建基础环境配置临时目录。"
 }
 
+resolve_managed_mise_config_file() {
+  local mise_config_directory=""
+
+  [[ -n "${HOME:-}" && "$HOME" != "/" ]] || fail "HOME 未设置或指向文件系统根目录。"
+
+  if [[ -n "${MISE_CONFIG_DIR:-}" ]]; then
+    mise_config_directory="${MISE_CONFIG_DIR%/}"
+  else
+    mise_config_directory="${XDG_CONFIG_HOME:-$HOME/.config}/mise"
+  fi
+
+  [[ -n "$mise_config_directory" && "$mise_config_directory" != "/" ]] ||
+    fail "mise 全局配置目录不能指向文件系统根目录。"
+  MANAGED_MISE_CONFIG_FILE="${mise_config_directory}/conf.d/${MANAGED_CONFIG_FILENAME}"
+}
+
+# 本地仓库执行读取同版本模板；curl | bash 没有相邻文件，因此回退到 main 分支 Raw URL。
+acquire_base_environment_template() {
+  local script_file="${BASH_SOURCE[0]:-}"
+  local script_directory=""
+  local local_template_file=""
+
+  TEMPLATE_SOURCE_FILE="${ISOLATED_WORK_DIRECTORY}/base-development-environment.toml"
+
+  if [[ -n "$script_file" && -f "$script_file" ]]; then
+    script_directory="$(cd "$(dirname "$script_file")" && pwd -P)"
+    local_template_file="${script_directory}/${TEMPLATE_RELATIVE_PATH}"
+  fi
+
+  if [[ -n "$local_template_file" && -f "$local_template_file" ]]; then
+    cp "$local_template_file" "$TEMPLATE_SOURCE_FILE"
+    printf '使用仓库内基础开发环境模板：%s\n' "$local_template_file"
+  else
+    command -v curl >/dev/null 2>&1 || fail "下载基础开发环境模板需要 curl，请先安装 curl 后重试。"
+    printf '正在下载基础开发环境模板：%s@%s...\n' "$GITHUB_REPOSITORY" "$GITHUB_BRANCH"
+    curl -fsSL "$TEMPLATE_DOWNLOAD_URL" -o "$TEMPLATE_SOURCE_FILE" ||
+      fail "无法下载基础开发环境模板：${TEMPLATE_DOWNLOAD_URL}。"
+  fi
+
+}
+
+sync_managed_mise_config() {
+  local managed_config_directory=""
+
+  managed_config_directory="$(dirname "$MANAGED_MISE_CONFIG_FILE")"
+  [[ ! -e "$MANAGED_MISE_CONFIG_FILE" || -f "$MANAGED_MISE_CONFIG_FILE" ]] ||
+    fail "mise 全局基础开发环境配置目标已存在但不是文件：${MANAGED_MISE_CONFIG_FILE}。"
+  mkdir -p "$managed_config_directory"
+  MANAGED_CONFIG_TEMP_FILE="$(mktemp "${managed_config_directory}/.${MANAGED_CONFIG_FILENAME}.XXXXXX")" ||
+    fail "无法在 mise 全局 conf.d 中创建临时配置文件。"
+  cp "$TEMPLATE_SOURCE_FILE" "$MANAGED_CONFIG_TEMP_FILE"
+  chmod 0644 "$MANAGED_CONFIG_TEMP_FILE"
+  mv -f "$MANAGED_CONFIG_TEMP_FILE" "$MANAGED_MISE_CONFIG_FILE"
+  MANAGED_CONFIG_TEMP_FILE=""
+
+  printf '已同步 mise 全局基础开发环境配置：%s\n' "$MANAGED_MISE_CONFIG_FILE"
+  printf '用户主 config.toml 与其他 conf.d 配置保持不变。\n'
+}
+
+install_global_tools() {
+  printf '\n正在按 mise 全局配置安装或更新工具...\n'
+  (
+    cd "$ISOLATED_WORK_DIRECTORY"
+    "$MISE_BIN" install --yes
+  )
+}
+
 ensure_global_tools() {
   prepare_isolated_work_directory
-
-  printf '\n正在检查 mise 全局工具...\n'
-  ensure_global_tool "node" "lts" "Node.js"
-  verify_global_tool "node" "Node.js"
-  ensure_global_tool "pnpm" "latest" "pnpm"
-  verify_global_tool "pnpm" "pnpm"
+  acquire_base_environment_template
+  sync_managed_mise_config
+  install_global_tools
 
   rm -rf -- "$ISOLATED_WORK_DIRECTORY"
   ISOLATED_WORK_DIRECTORY=""
@@ -414,9 +417,15 @@ print_summary() {
   printf '\n基础环境安装完成。\n'
   printf '  Shell：%s\n' "$ACTIVE_SHELL"
   printf '  mise：%s\n' "$MISE_BIN"
-  printf '  Node.js：%s（目标：lts）\n' "$NODE_VERSION"
-  printf '  pnpm：%s（目标：latest）\n' "$PNPM_VERSION"
-  printf '\n请重新打开终端，或加载配置文件后再使用 node、pnpm 和 mise。\n'
+  printf '  全局基础开发环境配置：%s\n' "$MANAGED_MISE_CONFIG_FILE"
+  printf '  基础工具：已按全局配置完成安装检查\n'
+  printf '\n当前终端尚未重新加载 mise 激活配置。请执行：\n'
+  case "$ACTIVE_SHELL" in
+    bash) printf '  source ~/.bashrc\n' ;;
+    zsh) printf '  source ~/.zshrc\n' ;;
+    fish) printf '  source ~/.config/fish/config.fish\n' ;;
+  esac
+  printf '也可以重新打开终端后再使用 mise 和基础工具。\n'
 }
 
 main() {
@@ -429,9 +438,11 @@ main() {
   find_mise
   if [[ -z "$MISE_BIN" ]]; then
     install_mise
-    configure_shell_activation
   fi
   printf '使用 mise：%s\n' "$MISE_BIN"
+  configure_shell_activation
+  ensure_mise_on_path
+  resolve_managed_mise_config_file
   ensure_global_tools
   print_summary
 }
