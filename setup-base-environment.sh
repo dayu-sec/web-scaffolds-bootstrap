@@ -9,55 +9,34 @@ readonly TEMPLATE_DOWNLOAD_URL="https://raw.githubusercontent.com/${GITHUB_REPOS
 readonly MANAGED_CONFIG_FILENAME="base-development-environment.toml"
 
 ASSUME_YES=false
+VERBOSE=false
 REQUESTED_SHELL=""
 ACTIVE_SHELL=""
 ACTIVE_SHELL_PATH=""
 MISE_BIN=""
 INSTALLER_TEMP_FILE=""
+MISE_INSTALL_LOG_FILE=""
 ISOLATED_WORK_DIRECTORY=""
 TEMPLATE_SOURCE_FILE=""
 MANAGED_CONFIG_TEMP_FILE=""
 MANAGED_MISE_CONFIG_FILE=""
+GLOBAL_TOOLS_INSTALL_LOG_FILE=""
 INTERACTIVE_TERMINAL_OPEN=false
 CONFLICT_TOOLS=""
-
-# 安装概览由 help 和交互引导共同使用，避免检查范围的文案在两处发生偏差。
-print_installation_overview() {
-  cat <<'EOF'
-安装内容：
-  1. 检查并安装 mise
-  2. 为当前登录 Shell 配置 mise 激活脚本
-  3. 同步基础开发环境模板到 mise 全局 conf.d 配置
-  4. 安装或更新 bun、deno、Java 21、Node.js LTS、nrm、Rust stable 和 uv
-  5. 通过 Corepack 启用由项目 packageManager 约束版本的 pnpm
-EOF
-}
-
-# 相似工具说明在执行检查前展示，明确脚本只报告冲突而不会主动卸载。
-print_conflict_notice() {
-  cat <<'EOF'
-说明：
-  脚本会检查 nvm、fnm、Volta、asdf、nodenv 和 n 等相似工具，但不会自动卸载。
-  基础开发环境模板作为全局默认配置写入 mise conf.d，不会覆盖用户的 config.toml。
-EOF
-}
 
 print_usage() {
   cat <<'EOF'
 用法：
   setup-base-environment.sh [选项]
 
-EOF
-  print_installation_overview
-  cat <<'EOF'
+安装 mise、配置 Shell，并同步和安装全局基础开发环境。
 
 选项：
   --shell <bash|zsh|fish>  指定要配置的 Shell；默认从 SHELL 环境变量侦测
   -y, --yes               非交互执行，自动确认 mise 安装和环境冲突提示
+  -v, --verbose           展示 mise 和安装后端的完整输出
   -h, --help              显示帮助
-
 EOF
-  print_conflict_notice
 }
 
 fail() {
@@ -71,6 +50,7 @@ fail() {
 
 cleanup() {
   [[ -z "$INSTALLER_TEMP_FILE" || ! -e "$INSTALLER_TEMP_FILE" ]] || rm -f "$INSTALLER_TEMP_FILE"
+  [[ -z "$MISE_INSTALL_LOG_FILE" || ! -e "$MISE_INSTALL_LOG_FILE" ]] || rm -f "$MISE_INSTALL_LOG_FILE"
   [[ -z "$MANAGED_CONFIG_TEMP_FILE" || ! -e "$MANAGED_CONFIG_TEMP_FILE" ]] || rm -f "$MANAGED_CONFIG_TEMP_FILE"
   # 工作目录只使用本次 mktemp 返回的精确路径，异常退出时也不遗留临时状态。
   [[ -z "$ISOLATED_WORK_DIRECTORY" || ! -d "$ISOLATED_WORK_DIRECTORY" ]] || rm -rf -- "$ISOLATED_WORK_DIRECTORY"
@@ -93,6 +73,10 @@ parse_arguments() {
         ASSUME_YES=true
         shift
         ;;
+      -v | --verbose)
+        VERBOSE=true
+        shift
+        ;;
       -h | --help)
         print_usage
         exit 0
@@ -111,19 +95,30 @@ open_interactive_terminal() {
   INTERACTIVE_TERMINAL_OPEN=true
 }
 
-# 交互执行在任何环境检查之前展示与 help 一致的范围和非破坏性边界。
-print_interactive_overview() {
-  if [[ "$INTERACTIVE_TERMINAL_OPEN" != true ]]; then
-    return 0
-  fi
-
-  printf '\n基础环境配置\n\n' >&3
-  print_installation_overview >&3
-  printf '\n' >&3
-  print_conflict_notice >&3
+print_header() {
+  printf '\n基础开发环境\n'
 }
 
-# 破坏性安装前只接受明确的继续或取消，直接回车表示继续。
+print_step() {
+  local number="$1"
+  local description="$2"
+
+  printf '\n[%s/4] %s\n' "$number" "$description"
+}
+
+print_step_result() {
+  printf '      %s\n' "$*"
+}
+
+print_log_tail() {
+  local log_file="$1"
+
+  [[ -s "$log_file" ]] || return 0
+  printf '\n最近的安装日志：\n'
+  tail -n 40 "$log_file" | sed 's/^/  /'
+}
+
+# 安装前只接受明确的继续或取消，直接回车表示继续。
 confirm_continue() {
   local message="$1"
   local answer=""
@@ -221,32 +216,13 @@ detect_conflicting_tools() {
 print_conflict_guidance() {
   [[ -n "$CONFLICT_TOOLS" ]] || return 0
 
-  printf '\n检测到可能与 mise 重复管理 Node.js 的工具：%s\n' "$CONFLICT_TOOLS"
-  printf '多个版本管理器同时修改 PATH，可能导致 node、npm 或 pnpm 实际版本与预期不一致。\n'
-  printf '本脚本不会自动删除任何现有工具。建议在确认不再需要后按各工具的安装来源卸载：\n'
+  printf '\n警告：检测到 %s，可能与 mise 同时修改 PATH。\n' "$CONFLICT_TOOLS"
+  if [[ "$ASSUME_YES" == true ]]; then
+    printf '继续配置 mise。\n'
+    return 0
+  fi
 
-  case " $CONFLICT_TOOLS " in
-    *" nvm "*)
-      printf '  - nvm：先执行 nvm unload，再删除 NVM_DIR 目录及 Shell 配置中的 NVM_DIR/nvm.sh 初始化行。\n'
-      ;;
-  esac
-  case " $CONFLICT_TOOLS " in
-    *" fnm "*)
-      printf '  - fnm：删除 FNM_DIR 或 fnm 数据目录，并移除 Shell 配置中的 fnm env 初始化行；若由包管理器安装，使用原包管理器卸载。\n'
-      ;;
-  esac
-  case " $CONFLICT_TOOLS " in
-    *" Volta "*)
-      printf '  - Volta：删除 ~/.volta，并移除 Shell 配置中的 VOLTA_HOME 和 PATH 配置。\n'
-      ;;
-  esac
-  case " $CONFLICT_TOOLS " in
-    *" asdf "* | *" nodenv "* | *" n "*)
-      printf '  - asdf/nodenv/n：按原安装方式卸载，并清理对应的 Shell 初始化配置。\n'
-      ;;
-  esac
-
-  confirm_continue "可以先退出并完成清理，也可以继续安装 mise，稍后再处理冲突。"
+  confirm_continue "是否继续配置 mise？"
 }
 
 find_mise() {
@@ -276,36 +252,47 @@ install_mise() {
   confirm_continue "未检测到 mise，即将从 https://mise.run 安装到 $HOME/.local/bin/mise。"
 
   INSTALLER_TEMP_FILE="$(mktemp "${temp_root%/}/mise-installer.XXXXXX")" || fail "无法创建 mise 安装器临时文件。"
-  printf '\n正在下载安装 mise...\n'
-  curl -fsSL https://mise.run -o "$INSTALLER_TEMP_FILE"
-  MISE_INSTALL_PATH="$HOME/.local/bin/mise" sh "$INSTALLER_TEMP_FILE"
+  MISE_INSTALL_LOG_FILE="${INSTALLER_TEMP_FILE}.log"
+  curl -fsSL https://mise.run -o "$INSTALLER_TEMP_FILE" ||
+    fail "无法下载 mise 安装器。"
+
+  if [[ "$VERBOSE" == true ]]; then
+    if ! MISE_INSTALL_PATH="$HOME/.local/bin/mise" sh "$INSTALLER_TEMP_FILE"; then
+      print_step_result "安装失败"
+      fail "mise 安装失败。"
+    fi
+  elif ! MISE_INSTALL_PATH="$HOME/.local/bin/mise" MISE_QUIET=1 sh "$INSTALLER_TEMP_FILE" >"$MISE_INSTALL_LOG_FILE" 2>&1; then
+    print_step_result "安装失败"
+    print_log_tail "$MISE_INSTALL_LOG_FILE"
+    fail "mise 安装失败。使用 --verbose 重试可查看完整过程。"
+  fi
+
   find_mise
   [[ -n "$MISE_BIN" && -x "$MISE_BIN" ]] || fail "mise 安装完成后仍未找到可执行文件。"
 }
 
 shell_config_file() {
   case "$ACTIVE_SHELL" in
-    bash) printf '%s\n' "$HOME/.bashrc" ;;
-    zsh) printf '%s\n' "$HOME/.zshrc" ;;
+    bash) printf '%s\n' "$HOME/.bash_profile" ;;
+    zsh) printf '%s\n' "$HOME/.zprofile" ;;
     fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
   esac
 }
 
 activation_line() {
-  local command_path="$MISE_BIN"
-
-  if [[ "$MISE_BIN" == "$HOME/.local/bin/mise" ]]; then
-    # 保留字面量 ~ 写入用户配置，实际加载 rc 文件时再由目标 Shell 展开。
-    # shellcheck disable=SC2088
-    command_path="~/.local/bin/mise"
-  fi
-
+  # mise 官方要求 profile 中的裸命令已在 PATH；使用本次发现的绝对路径避免登录时的 PATH 顺序问题。
   # 格式字符串保留字面量 $()，由用户启动目标 Shell 时执行。
   # shellcheck disable=SC2016
   case "$ACTIVE_SHELL" in
-    bash | zsh) printf 'eval "$(%s activate %s)"\n' "$command_path" "$ACTIVE_SHELL" ;;
-    fish) printf '%s activate fish | source\n' "$command_path" ;;
+    bash | zsh) printf 'eval "$(%s activate %s --shims)"\n' "$MISE_BIN" "$ACTIVE_SHELL" ;;
+    fish) printf '%s activate fish | source\n' "$MISE_BIN" ;;
   esac
+}
+
+shell_activation_is_configured() {
+  local config_file="$1"
+
+  grep -Eq "^[[:space:]]*[^#[:space:]].*mise[[:space:]]+activate[[:space:]]+${ACTIVE_SHELL}([[:space:]]|\\)|$)" "$config_file"
 }
 
 configure_shell_activation() {
@@ -317,15 +304,14 @@ configure_shell_activation() {
   mkdir -p "$(dirname "$config_file")"
   touch "$config_file"
 
-  # 识别既有 mise 激活配置，避免因安装路径写法不同而重复注入。
-  if grep -Eq "^[[:space:]]*([^#].*)?mise activate ${ACTIVE_SHELL}([[:space:]|\")]|$)" "$config_file"; then
-    printf '已存在 mise %s 激活配置：%s\n' "$ACTIVE_SHELL" "$config_file"
+  if shell_activation_is_configured "$config_file"; then
+    print_step_result "${ACTIVE_SHELL} 激活配置已存在：${config_file}"
     return
   fi
 
   [[ ! -s "$config_file" ]] || printf '\n' >>"$config_file"
   printf '%s\n' "$line" >>"$config_file"
-  printf '已写入 mise %s 激活配置：%s\n' "$ACTIVE_SHELL" "$config_file"
+  print_step_result "已添加 ${ACTIVE_SHELL} 激活配置：${config_file}"
 }
 
 # 创建本次环境配置专用的中性目录，隔离调用位置中的 mise.toml 和 npm 配置。
@@ -367,10 +353,8 @@ acquire_base_environment_template() {
 
   if [[ -n "$local_template_file" && -f "$local_template_file" ]]; then
     cp "$local_template_file" "$TEMPLATE_SOURCE_FILE"
-    printf '使用仓库内基础开发环境模板：%s\n' "$local_template_file"
   else
     command -v curl >/dev/null 2>&1 || fail "下载基础开发环境模板需要 curl，请先安装 curl 后重试。"
-    printf '正在下载基础开发环境模板：%s@%s...\n' "$GITHUB_REPOSITORY" "$GITHUB_BRANCH"
     curl -fsSL "$TEMPLATE_DOWNLOAD_URL" -o "$TEMPLATE_SOURCE_FILE" ||
       fail "无法下载基础开发环境模板：${TEMPLATE_DOWNLOAD_URL}。"
   fi
@@ -391,59 +375,72 @@ sync_managed_mise_config() {
   mv -f "$MANAGED_CONFIG_TEMP_FILE" "$MANAGED_MISE_CONFIG_FILE"
   MANAGED_CONFIG_TEMP_FILE=""
 
-  printf '已同步 mise 全局基础开发环境配置：%s\n' "$MANAGED_MISE_CONFIG_FILE"
-  printf '用户主 config.toml 与其他 conf.d 配置保持不变。\n'
+  print_step_result "已同步：${MANAGED_MISE_CONFIG_FILE}"
 }
 
 install_global_tools() {
-  printf '\n正在按 mise 全局配置安装或更新工具...\n'
-  (
+  GLOBAL_TOOLS_INSTALL_LOG_FILE="${ISOLATED_WORK_DIRECTORY}/mise-install.log"
+
+  if [[ "$VERBOSE" == true ]]; then
+    if ! (
+      cd "$ISOLATED_WORK_DIRECTORY"
+      "$MISE_BIN" install --yes --verbose
+    ); then
+      print_step_result "安装失败"
+      fail "mise 未能完成全局工具安装。"
+    fi
+  elif ! (
     cd "$ISOLATED_WORK_DIRECTORY"
-    "$MISE_BIN" install --yes
-  )
-}
+    "$MISE_BIN" install --yes >"$GLOBAL_TOOLS_INSTALL_LOG_FILE" 2>&1
+  ); then
+    print_step_result "安装失败"
+    print_log_tail "$GLOBAL_TOOLS_INSTALL_LOG_FILE"
+    fail "mise 未能完成全局工具安装。配置已同步，可以直接重试；使用 --verbose 可查看完整过程。"
+  fi
 
-ensure_global_tools() {
-  prepare_isolated_work_directory
-  acquire_base_environment_template
-  sync_managed_mise_config
-  install_global_tools
-
-  rm -rf -- "$ISOLATED_WORK_DIRECTORY"
-  ISOLATED_WORK_DIRECTORY=""
+  print_step_result "安装完成"
 }
 
 print_summary() {
-  printf '\n基础环境安装完成。\n'
-  printf '  Shell：%s\n' "$ACTIVE_SHELL"
-  printf '  mise：%s\n' "$MISE_BIN"
-  printf '  全局基础开发环境配置：%s\n' "$MANAGED_MISE_CONFIG_FILE"
-  printf '  基础工具：已按全局配置完成安装检查\n'
-  printf '\n当前终端尚未重新加载 mise 激活配置。请执行：\n'
+  printf '\n基础开发环境已配置。\n'
+  printf '请执行 '
   case "$ACTIVE_SHELL" in
-    bash) printf '  source ~/.bashrc\n' ;;
-    zsh) printf '  source ~/.zshrc\n' ;;
-    fish) printf '  source ~/.config/fish/config.fish\n' ;;
+    bash) printf 'source ~/.bash_profile' ;;
+    zsh) printf 'source ~/.zprofile' ;;
+    fish) printf 'source ~/.config/fish/config.fish' ;;
   esac
-  printf '也可以重新打开终端后再使用 mise 和基础工具。\n'
+  printf '，或重新打开终端。\n'
 }
 
 main() {
   parse_arguments "$@"
   open_interactive_terminal
-  print_interactive_overview
+  print_header
   detect_shell
   detect_conflicting_tools
   print_conflict_guidance
+
+  print_step "1" "检查 mise"
   find_mise
   if [[ -z "$MISE_BIN" ]]; then
     install_mise
+    print_step_result "已安装：${MISE_BIN}"
+  else
+    print_step_result "使用现有 mise：${MISE_BIN}"
   fi
-  printf '使用 mise：%s\n' "$MISE_BIN"
+
+  print_step "2" "配置 Shell"
   configure_shell_activation
   ensure_mise_on_path
+
+  print_step "3" "同步全局配置"
   resolve_managed_mise_config_file
-  ensure_global_tools
+  prepare_isolated_work_directory
+  acquire_base_environment_template
+  sync_managed_mise_config
+
+  print_step "4" "安装全局配置声明的工具"
+  install_global_tools
   print_summary
 }
 
