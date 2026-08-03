@@ -1,10 +1,10 @@
 [tools]
-bun = "latest"
-deno = "latest"
-java = "21"
+# bun = "latest"
+# deno = "latest"
+# java = "21"
 node = "lts"
 "npm:nrm" = "latest"
-rust = "stable"
+# rust = "stable"
 uv = "latest"
 
 [hooks]
