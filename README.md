@@ -62,6 +62,6 @@ curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/m
 
 基础开发环境默认配置会同步到 mise 全局 `conf.d/base-development-environment.toml`，不会覆盖用户已有的 `config.toml` 或其他全局配置。用户如需调整默认版本，应在自己的 `config.toml` 中覆盖对应配置。
 
-脚本结束后会根据当前 Shell 提示加载对应配置文件，例如 `source ~/.zprofile` 或 `source ~/.bash_profile`；也可以重新打开终端后再使用 mise 和配置中声明的工具。
+脚本会为当前 Shell 分别配置交互式 mise activation 与非交互式 shims；如果已有等价配置则保持不变。完成后重新打开终端，即可在交互终端、IDE 和非交互式登录 Shell 中使用 mise 管理的工具。
 
 安装过程默认只展示阶段结果；遇到问题时，可以使用 `--verbose` 查看 mise 和安装后端的完整输出。

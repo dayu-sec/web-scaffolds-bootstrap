@@ -7,6 +7,7 @@ readonly GITHUB_BRANCH="main"
 readonly TEMPLATE_RELATIVE_PATH="templates/base-development-environment.toml"
 readonly TEMPLATE_DOWNLOAD_URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_BRANCH}/${TEMPLATE_RELATIVE_PATH}"
 readonly MANAGED_CONFIG_FILENAME="base-development-environment.toml"
+readonly SCRIPT_FILE="${0:-}"
 
 ASSUME_YES=false
 VERBOSE=false
@@ -22,7 +23,8 @@ MANAGED_CONFIG_TEMP_FILE=""
 MANAGED_MISE_CONFIG_FILE=""
 GLOBAL_TOOLS_INSTALL_LOG_FILE=""
 INTERACTIVE_TERMINAL_OPEN=false
-CONFLICT_TOOLS=""
+PROFILE_CONFIG_FILE=""
+INTERACTIVE_CONFIG_FILE=""
 
 print_usage() {
   cat <<'EOF'
@@ -33,7 +35,7 @@ print_usage() {
 
 选项：
   --shell <bash|zsh|fish>  指定要配置的 Shell；默认从 SHELL 环境变量侦测
-  -y, --yes               非交互执行，自动确认 mise 安装和环境冲突提示
+  -y, --yes               非交互执行，自动确认 mise 安装
   -v, --verbose           展示 mise 和安装后端的完整输出
   -h, --help              显示帮助
 EOF
@@ -91,7 +93,9 @@ parse_arguments() {
 open_interactive_terminal() {
   [[ "$ASSUME_YES" == true ]] && return
   [[ -r /dev/tty && -w /dev/tty ]] || fail "当前环境无法交互，请在终端中运行，或使用 --yes 非交互执行。"
-  exec 3<>/dev/tty
+  if ! exec 3<>/dev/tty; then
+    fail "当前环境无法交互，请在终端中运行，或使用 --yes 非交互执行。"
+  fi
   INTERACTIVE_TERMINAL_OPEN=true
 }
 
@@ -168,63 +172,6 @@ detect_shell() {
   [[ -n "$ACTIVE_SHELL_PATH" ]] || fail "未找到 ${ACTIVE_SHELL}，请先安装该 Shell，或通过 --shell 选择已安装的 Shell。"
 }
 
-append_conflict() {
-  local tool="$1"
-
-  case " $CONFLICT_TOOLS " in
-    *" $tool "*) ;;
-    *) CONFLICT_TOOLS="${CONFLICT_TOOLS:+$CONFLICT_TOOLS }$tool" ;;
-  esac
-}
-
-config_contains() {
-  local pattern="$1"
-  local config_file=""
-
-  for config_file in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.config/fish/config.fish"; do
-    [[ -f "$config_file" ]] || continue
-    grep -Eq "$pattern" "$config_file" && return 0
-  done
-  return 1
-}
-
-# Shell 函数型版本管理器无法稳定通过 command -v 发现，因此同时检查目录和初始化配置。
-detect_conflicting_tools() {
-  if command -v nvm >/dev/null 2>&1 || [[ -e "${NVM_DIR:-$HOME/.nvm}" ]] || config_contains 'NVM_DIR|nvm\.sh'; then
-    append_conflict "nvm"
-  fi
-  if command -v fnm >/dev/null 2>&1 ||
-    [[ -n "${FNM_DIR:-}" && -e "${FNM_DIR:-}" ]] ||
-    [[ -e "$HOME/.fnm" || -e "${XDG_DATA_HOME:-$HOME/.local/share}/fnm" || -e "$HOME/Library/Application Support/fnm" ]] ||
-    config_contains 'fnm env|FNM_DIR'; then
-    append_conflict "fnm"
-  fi
-  if command -v volta >/dev/null 2>&1 || [[ -e "${VOLTA_HOME:-$HOME/.volta}" ]] || config_contains 'VOLTA_HOME|/\.volta/bin'; then
-    append_conflict "Volta"
-  fi
-  if command -v asdf >/dev/null 2>&1 || [[ -e "$HOME/.asdf" ]] || config_contains 'asdf\.sh|ASDF_DIR'; then
-    append_conflict "asdf"
-  fi
-  if command -v nodenv >/dev/null 2>&1 || [[ -e "$HOME/.nodenv" ]] || config_contains 'nodenv init|NODENV_ROOT'; then
-    append_conflict "nodenv"
-  fi
-  if command -v n >/dev/null 2>&1 || [[ -n "${N_PREFIX:-}" ]]; then
-    append_conflict "n"
-  fi
-}
-
-print_conflict_guidance() {
-  [[ -n "$CONFLICT_TOOLS" ]] || return 0
-
-  printf '\n警告：检测到 %s，可能与 mise 同时修改 PATH。\n' "$CONFLICT_TOOLS"
-  if [[ "$ASSUME_YES" == true ]]; then
-    printf '继续配置 mise。\n'
-    return 0
-  fi
-
-  confirm_continue "是否继续配置 mise？"
-}
-
 find_mise() {
   if [[ -x "$HOME/.local/bin/mise" ]]; then
     MISE_BIN="$HOME/.local/bin/mise"
@@ -271,47 +218,131 @@ install_mise() {
   [[ -n "$MISE_BIN" && -x "$MISE_BIN" ]] || fail "mise 安装完成后仍未找到可执行文件。"
 }
 
-shell_config_file() {
+bash_profile_file() {
+  if [[ -f "$HOME/.bash_profile" ]]; then
+    printf '%s\n' "$HOME/.bash_profile"
+  elif [[ -f "$HOME/.bash_login" ]]; then
+    printf '%s\n' "$HOME/.bash_login"
+  elif [[ -f "$HOME/.profile" ]]; then
+    printf '%s\n' "$HOME/.profile"
+  else
+    printf '%s\n' "$HOME/.bash_profile"
+  fi
+}
+
+resolve_shell_config_files() {
   case "$ACTIVE_SHELL" in
-    bash) printf '%s\n' "$HOME/.bash_profile" ;;
-    zsh) printf '%s\n' "$HOME/.zprofile" ;;
-    fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
+    bash)
+      PROFILE_CONFIG_FILE="$(bash_profile_file)"
+      INTERACTIVE_CONFIG_FILE="$HOME/.bashrc"
+      ;;
+    zsh)
+      PROFILE_CONFIG_FILE="$HOME/.zprofile"
+      INTERACTIVE_CONFIG_FILE="$HOME/.zshrc"
+      ;;
+    fish)
+      PROFILE_CONFIG_FILE="$HOME/.config/fish/config.fish"
+      INTERACTIVE_CONFIG_FILE="$PROFILE_CONFIG_FILE"
+      ;;
   esac
 }
 
-activation_line() {
-  # mise 官方要求 profile 中的裸命令已在 PATH；使用本次发现的绝对路径避免登录时的 PATH 顺序问题。
-  # 格式字符串保留字面量 $()，由用户启动目标 Shell 时执行。
-  # shellcheck disable=SC2016
-  case "$ACTIVE_SHELL" in
-    bash | zsh) printf 'eval "$(%s activate %s --shims)"\n' "$MISE_BIN" "$ACTIVE_SHELL" ;;
-    fish) printf '%s activate fish | source\n' "$MISE_BIN" ;;
-  esac
-}
-
-shell_activation_is_configured() {
+config_has_shims() {
   local config_file="$1"
 
-  grep -Eq "^[[:space:]]*[^#[:space:]].*mise[[:space:]]+activate[[:space:]]+${ACTIVE_SHELL}([[:space:]]|\\)|$)" "$config_file"
+  [[ -f "$config_file" ]] || return 1
+  grep -Eq "^[[:space:]]*[^#[:space:]].*(mise[[:space:]]+activate[[:space:]]+${ACTIVE_SHELL}[^#]*--shims|mise/shims)" "$config_file"
 }
 
-configure_shell_activation() {
-  local config_file=""
-  local line=""
+config_has_interactive_activation() {
+  local config_file="$1"
 
-  config_file="$(shell_config_file)"
-  line="$(activation_line)"
+  [[ -f "$config_file" ]] || return 1
+  grep -E "^[[:space:]]*[^#[:space:]].*mise[[:space:]]+activate[[:space:]]+${ACTIVE_SHELL}([[:space:]]|\\)|\\||$)" "$config_file" |
+    grep -Eqv -- '--shims'
+}
+
+append_config_line() {
+  local config_file="$1"
+  local line="$2"
+
   mkdir -p "$(dirname "$config_file")"
   touch "$config_file"
+  [[ ! -s "$config_file" ]] || printf '\n' >>"$config_file"
+  printf '%s\n' "$line" >>"$config_file"
+}
 
-  if shell_activation_is_configured "$config_file"; then
-    print_step_result "${ACTIVE_SHELL} 激活配置已存在：${config_file}"
+profile_activation_line() {
+  # 使用本次发现的绝对路径，避免 profile 加载时 mise 尚未进入 PATH。
+  # shellcheck disable=SC2016
+  printf 'eval "$(%s activate %s --shims)"\n' "$MISE_BIN" "$ACTIVE_SHELL"
+}
+
+interactive_activation_line() {
+  # shellcheck disable=SC2016
+  printf 'eval "$(%s activate %s)"\n' "$MISE_BIN" "$ACTIVE_SHELL"
+}
+
+configure_bash_or_zsh_activation() {
+  local existing_interactive_config=""
+
+  if config_has_shims "$PROFILE_CONFIG_FILE"; then
+    print_step_result "${ACTIVE_SHELL} 非交互配置已存在：${PROFILE_CONFIG_FILE}"
+  else
+    append_config_line "$PROFILE_CONFIG_FILE" "$(profile_activation_line)"
+    print_step_result "已添加 ${ACTIVE_SHELL} 非交互配置：${PROFILE_CONFIG_FILE}"
+  fi
+
+  if config_has_interactive_activation "$INTERACTIVE_CONFIG_FILE"; then
+    existing_interactive_config="$INTERACTIVE_CONFIG_FILE"
+  elif config_has_interactive_activation "$PROFILE_CONFIG_FILE"; then
+    existing_interactive_config="$PROFILE_CONFIG_FILE"
+  fi
+
+  if [[ -n "$existing_interactive_config" ]]; then
+    print_step_result "${ACTIVE_SHELL} 交互配置已存在：${existing_interactive_config}"
+  else
+    append_config_line "$INTERACTIVE_CONFIG_FILE" "$(interactive_activation_line)"
+    print_step_result "已添加 ${ACTIVE_SHELL} 交互配置：${INTERACTIVE_CONFIG_FILE}"
+  fi
+}
+
+configure_fish_activation() {
+  local has_interactive=false
+  local has_shims=false
+
+  config_has_interactive_activation "$PROFILE_CONFIG_FILE" && has_interactive=true
+  config_has_shims "$PROFILE_CONFIG_FILE" && has_shims=true
+
+  if [[ "$has_interactive" == true && "$has_shims" == true ]]; then
+    print_step_result "fish 交互与非交互配置已存在：${PROFILE_CONFIG_FILE}"
     return
   fi
 
-  [[ ! -s "$config_file" ]] || printf '\n' >>"$config_file"
-  printf '%s\n' "$line" >>"$config_file"
-  print_step_result "已添加 ${ACTIVE_SHELL} 激活配置：${config_file}"
+  mkdir -p "$(dirname "$PROFILE_CONFIG_FILE")"
+  touch "$PROFILE_CONFIG_FILE"
+  [[ ! -s "$PROFILE_CONFIG_FILE" ]] || printf '\n' >>"$PROFILE_CONFIG_FILE"
+
+  if [[ "$has_interactive" == false && "$has_shims" == false ]]; then
+    printf 'if status is-interactive\n  %s activate fish | source\nelse\n  %s activate fish --shims | source\nend\n' \
+      "$MISE_BIN" "$MISE_BIN" >>"$PROFILE_CONFIG_FILE"
+    print_step_result "已添加 fish 交互与非交互配置：${PROFILE_CONFIG_FILE}"
+  elif [[ "$has_interactive" == false ]]; then
+    printf 'if status is-interactive\n  %s activate fish | source\nend\n' "$MISE_BIN" >>"$PROFILE_CONFIG_FILE"
+    print_step_result "已添加 fish 交互配置：${PROFILE_CONFIG_FILE}"
+  else
+    printf 'if not status is-interactive\n  %s activate fish --shims | source\nend\n' "$MISE_BIN" >>"$PROFILE_CONFIG_FILE"
+    print_step_result "已添加 fish 非交互配置：${PROFILE_CONFIG_FILE}"
+  fi
+}
+
+configure_shell_activation() {
+  resolve_shell_config_files
+
+  case "$ACTIVE_SHELL" in
+    bash | zsh) configure_bash_or_zsh_activation ;;
+    fish) configure_fish_activation ;;
+  esac
 }
 
 # 创建本次环境配置专用的中性目录，隔离调用位置中的 mise.toml 和 npm 配置。
@@ -340,14 +371,13 @@ resolve_managed_mise_config_file() {
 
 # 本地仓库执行读取同版本模板；curl | bash 没有相邻文件，因此回退到 main 分支 Raw URL。
 acquire_base_environment_template() {
-  local script_file="${BASH_SOURCE[0]:-}"
   local script_directory=""
   local local_template_file=""
 
   TEMPLATE_SOURCE_FILE="${ISOLATED_WORK_DIRECTORY}/base-development-environment.toml"
 
-  if [[ -n "$script_file" && -f "$script_file" ]]; then
-    script_directory="$(cd "$(dirname "$script_file")" && pwd -P)"
+  if [[ -n "$SCRIPT_FILE" && -f "$SCRIPT_FILE" ]]; then
+    script_directory="$(cd "$(dirname "$SCRIPT_FILE")" && pwd -P)"
     local_template_file="${script_directory}/${TEMPLATE_RELATIVE_PATH}"
   fi
 
@@ -403,13 +433,7 @@ install_global_tools() {
 
 print_summary() {
   printf '\n基础开发环境已配置。\n'
-  printf '请执行 '
-  case "$ACTIVE_SHELL" in
-    bash) printf 'source ~/.bash_profile' ;;
-    zsh) printf 'source ~/.zprofile' ;;
-    fish) printf 'source ~/.config/fish/config.fish' ;;
-  esac
-  printf '，或重新打开终端。\n'
+  printf '请重新打开终端，使交互与非交互 Shell 配置生效。\n'
 }
 
 main() {
@@ -417,8 +441,6 @@ main() {
   open_interactive_terminal
   print_header
   detect_shell
-  detect_conflicting_tools
-  print_conflict_guidance
 
   print_step "1" "检查 mise"
   find_mise
