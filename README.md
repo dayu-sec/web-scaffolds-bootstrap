@@ -9,12 +9,12 @@
 ## Web Skills 配置
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" | bash -s -- -f
 ```
 
-该脚本将 [`dayu-sec/web-skills`](https://github.com/dayu-sec/web-skills) 仓库中 `AGENTS.md` 与 `skills/` 增量覆盖到 `~/.agents`；
+上述命令默认安装到 `~/.agents/skills`。脚本只安装 [`dayu-sec/web-skills`](https://github.com/dayu-sec/web-skills) 仓库中的完整 Skill，不会处理任何 `AGENTS.md`。
 
-如果 Agent 不支持此目录，请手动从 `~/.agents` 复制。
+自定义位置时使用 `--target <Agent 配置根目录> -f`，Skill 最终安装到 `<target>/skills`。
 
 ---
 
