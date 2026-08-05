@@ -45,7 +45,6 @@ print_usage() {
 
 名称规则：
   必须使用严格 kebab-case，只能包含小写字母、数字和单个连字符；最多 197 个字符。
-  示例：security-center
 
 生成结构：
   <项目名称>-web/
@@ -192,7 +191,7 @@ collect_interactive_arguments() {
   printf '\n创建微前端架构项目\n' >&3
 
   while true; do
-    printf '\n项目名称（必填）：\n规则：最多 %s 个字符；%s。\n示例：security-center\n> ' \
+    printf '\n项目名称（必填）：\n规则：最多 %s 个字符；%s。\n> ' \
       "$NAME_MAX_LENGTH" "$PROJECT_NAME_FORMAT_RULE" >&3
     read_from_terminal
     PROJECT_NAME="$USER_INPUT"
@@ -249,12 +248,10 @@ validate_target_directory() {
 confirm_interactive_configuration() {
   printf '\n即将创建微前端架构项目：\n' >&3
   printf '  工作区：%s\n' "$WORKSPACE_NAME" >&3
-  printf '  项目配置：%s\n' "$PROJECT_SETTINGS_NAME" >&3
-  printf '  主应用：%s\n' "$CONTAINER_NAME" >&3
-  printf '  首个微应用：%s\n' "$MICROAPP_NAME" >&3
-  printf '  微应用 pathname：%s\n' "$MICROAPP_PATHNAME" >&3
   printf '  目标目录：%s\n' "$TARGET_DIRECTORY" >&3
-  printf '  模板分支：%s\n' "${TEMPLATE_BRANCH:-各仓库默认分支}" >&3
+  if [[ -n "$TEMPLATE_BRANCH" ]]; then
+    printf '  模板分支：%s\n' "$TEMPLATE_BRANCH" >&3
+  fi
   if [[ "$KEEP_HISTORY" == true ]]; then
     printf '  Git 历史：保留，移除模板 origin\n' >&3
   else
@@ -453,11 +450,9 @@ publish_workspace() {
 
 print_result() {
   printf '\n微前端架构项目已创建：%s\n' "$TARGET_DIRECTORY"
-  printf '模板分支：%s\n' "${TEMPLATE_BRANCH:-各仓库默认分支}"
-  printf '项目配置：project/（%s）\n' "$PROJECT_SETTINGS_NAME"
-  printf '主应用：container/%s\n' "$CONTAINER_NAME"
-  printf '首个微应用：microapps/%s\n' "$MICROAPP_NAME"
-  printf '默认微应用：%s\n' "$MICROAPP_NAME"
+  printf '  project/\n'
+  printf '  container/%s/\n' "$CONTAINER_NAME"
+  printf '  microapps/%s/\n' "$MICROAPP_NAME"
   if [[ "$KEEP_HISTORY" == true ]]; then
     printf 'Git 历史：已保留，模板 origin 已移除\n'
   else
