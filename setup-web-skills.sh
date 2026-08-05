@@ -9,6 +9,7 @@ readonly GITHUB_ARCHIVE_URL="https://github.com/${GITHUB_REPOSITORY}/archive/ref
 readonly OBSOLETE_SKILL_PREFIX="dy-sec-"
 
 FORCE_INSTALL=false
+VERBOSE=false
 TARGET_SELECTION_REQUIRED=false
 TARGET_ARGUMENT=""
 INTERACTIVE_TERMINAL_OPEN=false
@@ -20,7 +21,9 @@ EXTRACTED_DIRECTORY=""
 ARCHIVE_ROOT_DIRECTORY=""
 AGENT_CONFIG_DIRECTORY=""
 SKILLS_DIRECTORY=""
+INSTALLED_SKILLS=""
 OBSOLETE_SKILLS_TO_REMOVE=""
+OBSOLETE_SKILL_COUNT=0
 ARCHIVE_SIZE_BYTES=0
 RESOURCE_FILE_COUNT=0
 SKILL_COUNT=0
@@ -43,7 +46,7 @@ print_usage() {
 用法：
   setup-web-skills.sh [选项]
 
-无参数时：
+未指定 --target 时：
   通过交互菜单选择用户级 $HOME/.agents、项目级 ./.agents，
   或自定义 Agent 配置根目录；Skill 最终安装到所选目录下的 skills/。
 
@@ -52,14 +55,16 @@ EOF
   cat <<'EOF'
 
 选项：
-  --target <目录>  Agent 配置根目录；默认是 $HOME/.agents
+  --target <目录>  Agent 配置根目录；未指定时通过交互菜单选择
                    支持绝对路径、~/ 开头的路径或相对当前目录的路径
   -f, --force      跳过安装与旧 Skill 清理确认，直接执行
+  -v, --verbose    显示详细清理与安装 Skill 列表
   -h, --help       显示帮助
 
 示例：
   setup-web-skills.sh --target "$HOME/.agents"
   setup-web-skills.sh --target ./.kiro --force
+  setup-web-skills.sh --force --verbose
 
 说明：
   脚本安装 GitHub 公开仓库 main 分支的当前 Skills，不需要 GitHub Token。
@@ -95,10 +100,6 @@ cleanup() {
 trap cleanup EXIT
 
 parse_arguments() {
-  if (($# == 0)); then
-    TARGET_SELECTION_REQUIRED=true
-  fi
-
   while (($# > 0)); do
     case "$1" in
       --target)
@@ -111,6 +112,10 @@ parse_arguments() {
         FORCE_INSTALL=true
         shift
         ;;
+      -v | --verbose)
+        VERBOSE=true
+        shift
+        ;;
       -h | --help)
         print_usage
         exit 0
@@ -120,6 +125,10 @@ parse_arguments() {
         ;;
     esac
   done
+
+  if [[ -z "$TARGET_ARGUMENT" ]]; then
+    TARGET_SELECTION_REQUIRED=true
+  fi
 }
 
 validate_runtime_dependencies() {
@@ -136,14 +145,14 @@ validate_runtime_dependencies() {
   done
 }
 
-# 无参数模式和非 force 的最终确认都固定从控制终端读取，不占用管道标准输入。
+# 未指定 --target 的位置选择和非 force 的最终确认都固定从控制终端读取，不占用管道标准输入。
 open_interactive_terminal() {
   if [[ "$TARGET_SELECTION_REQUIRED" != true && "$FORCE_INSTALL" == true ]]; then
     return
   fi
-  [[ -r /dev/tty && -w /dev/tty ]] ||
+  if ! { exec 3<>/dev/tty; } 2>/dev/null; then
     fail "当前环境无法交互，请使用 --target <Agent 配置根目录> --force 执行。"
-  exec 3<>/dev/tty
+  fi
   INTERACTIVE_TERMINAL_OPEN=true
 }
 
@@ -211,7 +220,7 @@ resolve_installation_directories() {
       fail "--target 不支持 ~user 形式，请使用绝对路径。"
       ;;
     *)
-      AGENT_CONFIG_DIRECTORY="${INVOCATION_DIRECTORY%/}/${TARGET_ARGUMENT}"
+      AGENT_CONFIG_DIRECTORY="${INVOCATION_DIRECTORY%/}/${TARGET_ARGUMENT#./}"
       ;;
   esac
 
@@ -245,6 +254,41 @@ ${obsolete_skill_name}"
       fi
     done < <(find "$SKILLS_DIRECTORY" -mindepth 1 -maxdepth 1 \
       -name "${OBSOLETE_SKILL_PREFIX}*" -print0)
+
+    if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
+      OBSOLETE_SKILLS_TO_REMOVE="$(printf '%s\n' "$OBSOLETE_SKILLS_TO_REMOVE" | sort -u)"
+      OBSOLETE_SKILL_COUNT="$(printf '%s\n' "$OBSOLETE_SKILLS_TO_REMOVE" | grep -c . || true)"
+    fi
+  fi
+}
+
+# 仅清除归档不再提供的团队 Skill，避免更新同名 Skill 后又删除刚安装的目录。
+exclude_installed_skills_from_cleanup() {
+  local obsolete_skill_name=""
+  local remaining_obsolete_skills=""
+
+  [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]] || return 0
+
+  while IFS= read -r obsolete_skill_name; do
+    [[ -n "$obsolete_skill_name" ]] || continue
+    if [[ -d "${EXTRACTED_DIRECTORY}/skills/${obsolete_skill_name}" ]]; then
+      continue
+    fi
+
+    if [[ -n "$remaining_obsolete_skills" ]]; then
+      remaining_obsolete_skills="${remaining_obsolete_skills}
+${obsolete_skill_name}"
+    else
+      remaining_obsolete_skills="$obsolete_skill_name"
+    fi
+  done <<EOF
+$OBSOLETE_SKILLS_TO_REMOVE
+EOF
+
+  OBSOLETE_SKILLS_TO_REMOVE="$remaining_obsolete_skills"
+  OBSOLETE_SKILL_COUNT=0
+  if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
+    OBSOLETE_SKILL_COUNT="$(printf '%s\n' "$OBSOLETE_SKILLS_TO_REMOVE" | grep -c . || true)"
   fi
 }
 
@@ -322,8 +366,10 @@ validate_and_extract_archive() {
   local source_skill=""
   local resource_directory=""
   local resource_file_count=0
+  local skill_name=""
   SKILL_COUNT=0
   RESOURCE_FILE_COUNT=0
+  INSTALLED_SKILLS=""
   while IFS= read -r -d '' source_skill; do
     [[ -d "$source_skill" ]] ||
       fail "skills/ 只能包含一级 Skill 目录：${source_skill##*/}。"
@@ -331,6 +377,14 @@ validate_and_extract_archive() {
       fail "Skill 目录缺少 SKILL.md：${source_skill##*/}。"
     SKILL_COUNT=$((SKILL_COUNT + 1))
     RESOURCE_FILE_COUNT=$((RESOURCE_FILE_COUNT + 1))
+
+    skill_name="${source_skill##*/}"
+    if [[ -n "$INSTALLED_SKILLS" ]]; then
+      INSTALLED_SKILLS="${INSTALLED_SKILLS}
+${skill_name}"
+    else
+      INSTALLED_SKILLS="$skill_name"
+    fi
 
     for resource_directory in agents references scripts assets; do
       [[ -d "${source_skill}/${resource_directory}" ]] || continue
@@ -340,7 +394,12 @@ validate_and_extract_archive() {
     done
   done < <(find "${EXTRACTED_DIRECTORY}/skills" -mindepth 1 -maxdepth 1 -print0)
 
+  if [[ -n "$INSTALLED_SKILLS" ]]; then
+    INSTALLED_SKILLS="$(printf '%s\n' "$INSTALLED_SKILLS" | sort -u)"
+  fi
+
   ((SKILL_COUNT > 0)) || fail "Source code 中没有可安装的 Skill。"
+  exclude_installed_skills_from_cleanup
 }
 
 print_installation_preview() {
@@ -350,20 +409,30 @@ print_installation_preview() {
   [[ "$INTERACTIVE_TERMINAL_OPEN" == true ]] && output_fd=3
   printf '\n即将安装 Web Skills：\n' >&"$output_fd"
   printf '  GitHub 来源：%s@%s\n' "$GITHUB_REPOSITORY" "$GITHUB_BRANCH" >&"$output_fd"
-  printf '  Source code：tar.gz，%s 字节\n' "$ARCHIVE_SIZE_BYTES" >&"$output_fd"
+  if [[ "$VERBOSE" == true ]]; then
+    printf '  Source code：tar.gz，%s 字节\n' "$ARCHIVE_SIZE_BYTES" >&"$output_fd"
+  fi
   printf '  Skill 数量：%s\n' "$SKILL_COUNT" >&"$output_fd"
-  printf '  资源文件：%s\n' "$RESOURCE_FILE_COUNT" >&"$output_fd"
+  if [[ "$VERBOSE" == true ]]; then
+    printf '  资源文件：%s\n' "$RESOURCE_FILE_COUNT" >&"$output_fd"
+  fi
   printf '  Agent 配置根：%s\n' "$AGENT_CONFIG_DIRECTORY" >&"$output_fd"
   printf '  Skills 目录：%s\n' "$SKILLS_DIRECTORY" >&"$output_fd"
-  printf '  更新方式：增量覆盖；保留额外 Skill、plugins/ 和其他 Agent 配置\n' >&"$output_fd"
+  if [[ "$VERBOSE" == true ]]; then
+    printf '  更新方式：增量覆盖；保留额外 Skill、plugins/ 和其他 Agent 配置\n' >&"$output_fd"
+  fi
   if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-    printf '  清除旧 Skill：\n' >&"$output_fd"
-    while IFS= read -r obsolete_skill_name; do
-      [[ -n "$obsolete_skill_name" ]] || continue
-      printf '    - %s/%s\n' "$SKILLS_DIRECTORY" "$obsolete_skill_name" >&"$output_fd"
-    done <<EOF
+    if [[ "$VERBOSE" == true ]]; then
+      printf '  清除旧 Skill：\n' >&"$output_fd"
+      while IFS= read -r obsolete_skill_name; do
+        [[ -n "$obsolete_skill_name" ]] || continue
+        printf '    - %s/%s\n' "$SKILLS_DIRECTORY" "$obsolete_skill_name" >&"$output_fd"
+      done <<EOF
 $OBSOLETE_SKILLS_TO_REMOVE
 EOF
+    else
+      printf '  清除旧 Skill：%s 个\n' "$OBSOLETE_SKILL_COUNT" >&"$output_fd"
+    fi
   fi
 }
 
@@ -435,6 +504,7 @@ EOF
 }
 
 print_summary() {
+  local skill_name=""
   local obsolete_skill_name=""
 
   printf '\nWeb Skills 安装完成。\n'
@@ -442,13 +512,30 @@ print_summary() {
   printf '  Agent 配置根：%s\n' "$AGENT_CONFIG_DIRECTORY"
   printf '  Skills 目录：%s\n' "$SKILLS_DIRECTORY"
   printf '  Skill 数量：%s\n' "$SKILL_COUNT"
-  if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-    while IFS= read -r obsolete_skill_name; do
-      [[ -n "$obsolete_skill_name" ]] || continue
-      printf '  已清除旧 Skill：%s\n' "$obsolete_skill_name"
-    done <<EOF
+
+  if [[ "$VERBOSE" == true ]]; then
+    if [[ -n "$INSTALLED_SKILLS" ]]; then
+      printf '  已安装 Skill：\n'
+      while IFS= read -r skill_name; do
+        [[ -n "$skill_name" ]] || continue
+        printf '    - %s\n' "$skill_name"
+      done <<EOF
+$INSTALLED_SKILLS
+EOF
+    fi
+    if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
+      printf '  已清除旧 Skill：\n'
+      while IFS= read -r obsolete_skill_name; do
+        [[ -n "$obsolete_skill_name" ]] || continue
+        printf '    - %s\n' "$obsolete_skill_name"
+      done <<EOF
 $OBSOLETE_SKILLS_TO_REMOVE
 EOF
+    fi
+  else
+    if (( OBSOLETE_SKILL_COUNT > 0 )); then
+      printf '  已清除旧 Skill：%s 个\n' "$OBSOLETE_SKILL_COUNT"
+    fi
   fi
   printf '\n重新启动对应 Agent 会话后即可加载最新 Skills。\n'
 }
@@ -463,7 +550,9 @@ main() {
   prepare_work_directory
   download_source_archive
   validate_and_extract_archive
-  print_installation_preview
+  if [[ "$VERBOSE" == true || "$FORCE_INSTALL" != true ]]; then
+    print_installation_preview
+  fi
   confirm_installation
   install_skills
   print_summary

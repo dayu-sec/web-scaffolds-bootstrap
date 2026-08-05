@@ -12,10 +12,6 @@
 curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" | bash -s -- -f
 ```
 
-上述命令默认安装到 `~/.agents/skills`。脚本只安装 [`dayu-sec/web-skills`](https://github.com/dayu-sec/web-skills) 仓库中的完整 Skill，不会处理任何 `AGENTS.md`。
-
-自定义位置时使用 `--target <Agent 配置根目录> -f`，Skill 最终安装到 `<target>/skills`。
-
 ---
 
 ## 创建微应用
