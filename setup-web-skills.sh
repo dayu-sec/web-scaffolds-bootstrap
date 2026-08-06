@@ -121,7 +121,7 @@ parse_arguments() {
         exit 0
         ;;
       *)
-        fail "无法识别的参数：$1。使用 --help 查看用法。"
+        fail "无法识别的参数：${1}。使用 --help 查看用法。"
         ;;
     esac
   done
@@ -201,6 +201,9 @@ collect_interactive_target() {
 
 # --target 表示 Agent 配置根目录；所有 Skill 都安装到该目录下的 skills/。
 resolve_installation_directories() {
+  # 去除尾部斜杠，保持路径一致性；避免 "$HOME/" 绕过 HOME 目录保护检查。
+  [[ "$TARGET_ARGUMENT" != "/" ]] && TARGET_ARGUMENT="${TARGET_ARGUMENT%/}"
+
   local normalized_home="${HOME%/}"
 
   case "$TARGET_ARGUMENT" in

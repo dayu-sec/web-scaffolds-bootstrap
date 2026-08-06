@@ -111,7 +111,7 @@ parse_arguments() {
         exit 0
         ;;
       *)
-        fail "无法识别的参数：$1。使用 --help 查看用法。"
+        fail "无法识别的参数：${1}。使用 --help 查看用法。"
         ;;
     esac
   done

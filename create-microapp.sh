@@ -112,7 +112,7 @@ parse_arguments() {
         exit 0
         ;;
       *)
-        fail "无法识别的参数：$1。使用 --help 查看用法。"
+        fail "无法识别的参数：${1}。使用 --help 查看用法。"
         ;;
     esac
   done
@@ -282,6 +282,9 @@ confirm_interactive_configuration() {
 }
 
 resolve_target_directory() {
+  # 去除尾部斜杠，保持路径一致性；单独的 "/" 不做处理。
+  [[ "$TARGET_ARGUMENT" != "/" ]] && TARGET_ARGUMENT="${TARGET_ARGUMENT%/}"
+
   if [[ -z "$TARGET_ARGUMENT" ]]; then
     TARGET_DIRECTORY="${PWD}/${MICROAPP_NAME}"
   elif [[ "$TARGET_ARGUMENT" == "." ]]; then
@@ -295,12 +298,12 @@ resolve_target_directory() {
 
 validate_target_directory() {
   [[ ! -e "$TARGET_DIRECTORY" || -d "$TARGET_DIRECTORY" ]] ||
-    fail "目标路径已存在且不是目录：$TARGET_DIRECTORY。"
+    fail "目标路径已存在且不是目录：${TARGET_DIRECTORY}。"
 
   # git clone 可以使用已存在的空目录，但不能安全覆盖任何已有内容。
   if [[ -d "$TARGET_DIRECTORY" ]] &&
     [[ -n "$(find "$TARGET_DIRECTORY" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-    fail "目标目录不是空目录：$TARGET_DIRECTORY。"
+    fail "目标目录不是空目录：${TARGET_DIRECTORY}。"
   fi
 }
 
