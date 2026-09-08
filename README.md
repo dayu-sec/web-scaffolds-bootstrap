@@ -8,8 +8,26 @@
 
 ## Web Skills 配置
 
+交互式执行：
+
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" | bash -s -- -f
+curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" | bash
+```
+
+非交互执行：
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" \
+  | bash -s -- --target ./.agents --profile monolith,ui-internal --force
+```
+
+多个项目批量更新：
+
+```bash
+for project in project-a project-b; do
+  (cd "$project" && curl -fsSL "https://raw.githubusercontent.com/dayu-sec/web-scaffolds-bootstrap/main/setup-web-skills.sh" \
+    | bash -s -- --target ./.agents --profile monolith,ui-internal --force)
+done
 ```
 
 ---

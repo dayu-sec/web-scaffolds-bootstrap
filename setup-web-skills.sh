@@ -2,16 +2,18 @@
 
 set -Eeuo pipefail
 
-# Web Skills 目前通过公开 GitHub 仓库的 main 分支分发，无需 Token。
+# Web Skills 通过公开 GitHub 仓库分发，无需 Token；默认取 main 分支，可用 --branch 指定其他分支。
 readonly GITHUB_REPOSITORY="dayu-sec/web-skills"
-readonly GITHUB_BRANCH="main"
-readonly GITHUB_ARCHIVE_URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/heads/${GITHUB_BRANCH}.tar.gz"
-readonly OBSOLETE_SKILL_PREFIX="dy-sec-"
+readonly DEFAULT_GITHUB_BRANCH="main"
+GITHUB_BRANCH="$DEFAULT_GITHUB_BRANCH"
+GITHUB_ARCHIVE_URL=""
 
+# 以下为跨函数共享的可变状态；Bash 没有结构体，只能用全局变量在参数解析、交互选择与安装各阶段之间传递数据。
 FORCE_INSTALL=false
 VERBOSE=false
 TARGET_SELECTION_REQUIRED=false
 TARGET_ARGUMENT=""
+PROFILE_ARGUMENT=""
 INTERACTIVE_TERMINAL_OPEN=false
 INVOCATION_DIRECTORY="${PWD:-}"
 WORK_DIRECTORY=""
@@ -21,9 +23,21 @@ EXTRACTED_DIRECTORY=""
 ARCHIVE_ROOT_DIRECTORY=""
 AGENT_CONFIG_DIRECTORY=""
 SKILLS_DIRECTORY=""
-INSTALLED_SKILLS=""
-OBSOLETE_SKILLS_TO_REMOVE=""
-OBSOLETE_SKILL_COUNT=0
+ARCHIVE_SKILLS=""
+PROFILES_DIRECTORY=""
+SELECTED_PROFILES=""
+SELECTED_SKILLS=""
+TERMINAL_STATE_SAVED=""
+PICKER_KEY=""
+PICKER_CURSOR=0
+PICKER_RENDERED_LINES=0
+MENU_LABELS=()
+MENU_TOTAL=0
+MENU_CURSOR=0
+PROFILE_TOTAL=0
+PROFILE_NAMES=()
+PROFILE_LABELS=()
+PROFILE_MARKS=()
 ARCHIVE_SIZE_BYTES=0
 RESOURCE_FILE_COUNT=0
 SKILL_COUNT=0
@@ -33,47 +47,56 @@ print_installation_overview() {
   cat <<'EOF'
 安装内容：
   1. 下载 GitHub 上 dayu-sec/web-skills 的 main 分支源码归档
-  2. 校验归档并只选择其中的 skills/ 资源
-  3. 将完整 Skill 目录增量覆盖到指定 Agent 配置根目录下的 skills/
-  4. 发现目标 skills/ 下的 dy-sec-* 旧 Skill 时，列出并在新 Skills 安装成功后清除
+  2. 校验归档并只选择其中的 skills/ 与 profiles/ 资源
+  3. 按选定组合确定本次安装 Skill 名单
+  4. 名单内的每个 Skill 在目标 skills/ 下整目录替换
 
+安装器只处理名单内的 Skill 目录名；名单之外的目录一律不读取、不列出、不删除。
 安装器不会读取、创建、复制、追加、覆盖或删除任何 AGENTS.md。
 EOF
 }
 
+# 帮助文本与 print_installation_overview 共享安装说明段落，避免 --help 与实际安装步骤描述不一致。
 print_usage() {
   cat <<'EOF'
 用法：
   setup-web-skills.sh [选项]
 
 未指定 --target 时：
-  通过交互菜单选择用户级 $HOME/.agents、项目级 ./.agents，
+  通过交互菜单选择项目级 ./.agents、用户级 $HOME/.agents，
   或自定义 Agent 配置根目录；Skill 最终安装到所选目录下的 skills/。
+
+未指定 --profile 时：
+  在可交互终端下勾选安装组合；使用 --force 或无法交互时安装全部 Skill。
 
 EOF
   print_installation_overview
   cat <<'EOF'
 
 选项：
-  --target <目录>  Agent 配置根目录；未指定时通过交互菜单选择
-                   支持绝对路径、~/ 开头的路径或相对当前目录的路径
-  -f, --force      跳过安装与旧 Skill 清理确认，直接执行
-  -v, --verbose    显示详细清理与安装 Skill 列表
-  -h, --help       显示帮助
+  --target <目录>   Agent 配置根目录；未指定时通过交互菜单选择
+                    支持绝对路径、~/ 开头的路径或相对当前目录的路径
+  --profile <名单>  安装组合，逗号分隔；指定后跳过交互勾选
+  --branch <分支>   GitHub 分支，默认 main
+  -f, --force       跳过组合勾选与安装确认，直接安装全部 Skill
+  -v, --verbose     显示详细安装信息
+  -h, --help        显示帮助
 
 示例：
-  setup-web-skills.sh --target "$HOME/.agents"
-  setup-web-skills.sh --target ./.kiro --force
-  setup-web-skills.sh --force --verbose
+  setup-web-skills.sh --target ./.agents
+  setup-web-skills.sh --target ./.agents --profile monolith,ui-internal --force
+  setup-web-skills.sh --target "$HOME/.agents" --force
 
 说明：
-  脚本安装 GitHub 公开仓库 main 分支的当前 Skills，不需要 GitHub Token。
+  脚本安装 GitHub 公开仓库指定分支的当前 Skills，不需要 GitHub Token。
+  可用组合由 web-skills 仓库的 profiles/ 定义，本脚本不硬编码任何组合或 Skill 名称。
   Source code 归档、解压目录和校验文件仅保存在临时目录，退出时自动清理。
-  增量覆盖不会删除额外 Skill、plugins/ 或其他 Agent 配置。
 EOF
 }
 
+# 统一失败出口：交互终端已打开时把错误写到控制终端（fd 3），避免被菜单的转义序列吞掉。
 fail() {
+  restore_terminal_state
   if [[ "$INTERACTIVE_TERMINAL_OPEN" == true ]]; then
     printf '错误：%s\n' "$*" >&3
   else
@@ -82,12 +105,29 @@ fail() {
   exit 1
 }
 
+# 交互界面会改动终端属性；正常退出、失败和中断都必须还原，否则终端会停在无回显状态。
+enter_raw_mode() {
+  TERMINAL_STATE_SAVED="$(stty -g <&3)" ||
+    fail "无法读取终端属性，请改用 --target 与 --profile 非交互执行。"
+  stty -icanon -echo min 1 time 0 <&3 ||
+    fail "无法进入终端原始模式，请改用 --target 与 --profile 非交互执行。"
+}
+
+# 只有真正保存过终端属性、且交互终端已打开时才尝试恢复，避免在非交互路径上误操作未打开的 fd 3。
+restore_terminal_state() {
+  [[ -n "$TERMINAL_STATE_SAVED" ]] || return 0
+  [[ "$INTERACTIVE_TERMINAL_OPEN" == true ]] || return 0
+  stty "$TERMINAL_STATE_SAVED" <&3 2>/dev/null || true
+  TERMINAL_STATE_SAVED=""
+}
+
 # 临时目录由本次 mktemp 独占，成功、失败或中断都不得遗留下载制品和解压内容。
 cleanup() {
   local exit_code=$?
 
-  trap - EXIT
+  trap - EXIT INT TERM
   set +e
+  restore_terminal_state
   if [[ -n "$WORK_DIRECTORY" && -d "$WORK_DIRECTORY" ]]; then
     rm -rf -- "$WORK_DIRECTORY"
   fi
@@ -97,8 +137,9 @@ cleanup() {
   exit "$exit_code"
 }
 
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
+# 只做参数解析与基础格式校验；路径、组合名等语义校验交给后续专职函数处理。
 parse_arguments() {
   while (($# > 0)); do
     case "$1" in
@@ -106,6 +147,21 @@ parse_arguments() {
         (($# >= 2)) || fail "--target 需要提供值。"
         [[ -n "$2" ]] || fail "--target 不能是空字符串。"
         TARGET_ARGUMENT="$2"
+        shift 2
+        ;;
+      --profile)
+        (($# >= 2)) || fail "--profile 需要提供值。"
+        [[ -n "$2" ]] || fail "--profile 不能是空字符串。"
+        PROFILE_ARGUMENT="$2"
+        shift 2
+        ;;
+      --branch)
+        (($# >= 2)) || fail "--branch 需要提供值。"
+        [[ -n "$2" ]] || fail "--branch 不能是空字符串。"
+        case "$2" in
+          -* | *' '* | *'..'* | */) fail "--branch 不是合法的分支名：${2}。" ;;
+        esac
+        GITHUB_BRANCH="$2"
         shift 2
         ;;
       -f | --force)
@@ -129,8 +185,11 @@ parse_arguments() {
   if [[ -z "$TARGET_ARGUMENT" ]]; then
     TARGET_SELECTION_REQUIRED=true
   fi
+
+  GITHUB_ARCHIVE_URL="https://github.com/${GITHUB_REPOSITORY}/archive/refs/heads/${GITHUB_BRANCH}.tar.gz"
 }
 
+# 在联网下载前集中做前置检查，让配置缺失或命令缺失尽早失败，而不是下载后才报错。
 validate_runtime_dependencies() {
   [[ -n "$GITHUB_REPOSITORY" ]] || fail "请先配置 GITHUB_REPOSITORY。"
   [[ -n "$GITHUB_BRANCH" ]] || fail "请先配置 GITHUB_BRANCH。"
@@ -140,12 +199,13 @@ validate_runtime_dependencies() {
     fail "无法确定脚本启动时的当前目录。"
 
   local command_name
-  for command_name in curl tar mktemp find cp awk rm; do
+  for command_name in curl tar mktemp find cp awk rm sort stty; do
     command -v "$command_name" >/dev/null 2>&1 || fail "缺少必需命令：${command_name}。"
   done
 }
 
-# 未指定 --target 的位置选择和非 force 的最终确认都固定从控制终端读取，不占用管道标准输入。
+# 位置选择、组合勾选和最终确认都固定从控制终端读取，不占用管道标准输入。
+# 已指定 --target 且带 --force 时全程无需交互，直接跳过，不打开 /dev/tty。
 open_interactive_terminal() {
   if [[ "$TARGET_SELECTION_REQUIRED" != true && "$FORCE_INSTALL" == true ]]; then
     return
@@ -156,47 +216,102 @@ open_interactive_terminal() {
   INTERACTIVE_TERMINAL_OPEN=true
 }
 
+# 单选菜单的一次性绘制，记录渲染行数供上层用转义序列清屏重绘。
+render_single_choice_menu() {
+  local title="$1"
+  local index=0
+  local pointer=""
+
+  printf '%s\n' "$title" >&3
+  printf '  ↑↓ 或 j/k 移动，回车确认，q 取消\n\n' >&3
+  PICKER_RENDERED_LINES=3
+
+  while ((index < MENU_TOTAL)); do
+    if ((index == MENU_CURSOR)); then
+      pointer=">"
+    else
+      pointer=" "
+    fi
+    printf '  %s %s\n' "$pointer" "${MENU_LABELS[index]}" >&3
+    PICKER_RENDERED_LINES=$((PICKER_RENDERED_LINES + 1))
+    index=$((index + 1))
+  done
+}
+
+# 单选菜单与组合勾选共用同一套按键与终端处理，保持交互一致。
+run_single_choice_menu() {
+  local title="$1"
+
+  enter_raw_mode
+  MENU_CURSOR=0
+  PICKER_RENDERED_LINES=0
+  while true; do
+    if ((PICKER_RENDERED_LINES > 0)); then
+      printf '\033[%dA\033[J' "$PICKER_RENDERED_LINES" >&3
+    fi
+    render_single_choice_menu "$title"
+    read_picker_key
+
+    case "$PICKER_KEY" in
+      up)
+        if ((MENU_CURSOR > 0)); then
+          MENU_CURSOR=$((MENU_CURSOR - 1))
+        fi
+        ;;
+      down)
+        if ((MENU_CURSOR < MENU_TOTAL - 1)); then
+          MENU_CURSOR=$((MENU_CURSOR + 1))
+        fi
+        ;;
+      enter)
+        restore_terminal_state
+        printf '\n' >&3
+        return 0
+        ;;
+      quit)
+        restore_terminal_state
+        printf '\n已取消。\n' >&3
+        exit 0
+        ;;
+    esac
+  done
+}
+
+# 未通过 --target 指定安装位置时，用单选菜单在项目级、用户级与自定义目录之间选择。
 collect_interactive_target() {
-  local selection=""
   local custom_target=""
 
   if [[ "$TARGET_SELECTION_REQUIRED" != true ]]; then
     return 0
   fi
 
-  while true; do
-    printf '\n请选择 Web Skills 安装位置：\n' >&3
-    printf '  1. 用户级：%s/.agents（默认）\n' "${HOME%/}" >&3
-    printf '  2. 项目级：%s/.agents\n' "${INVOCATION_DIRECTORY%/}" >&3
-    printf '  3. 自定义 Agent 配置根目录\n' >&3
-    printf '请选择 [1]：' >&3
-    IFS= read -r selection <&3 || fail "未能读取安装位置。"
+  MENU_LABELS=(
+    "项目级：${INVOCATION_DIRECTORY%/}/.agents"
+    "用户级：${HOME%/}/.agents"
+    "自定义 Agent 配置根目录"
+  )
+  MENU_TOTAL=3
+  run_single_choice_menu "请选择 Web Skills 安装位置"
 
-    case "$selection" in
-      "" | 1)
-        TARGET_ARGUMENT="${HOME%/}/.agents"
-        return
-        ;;
-      2)
-        TARGET_ARGUMENT=".agents"
-        return
-        ;;
-      3)
-        while true; do
-          printf '请输入 Agent 配置根目录：' >&3
-          IFS= read -r custom_target <&3 || fail "未能读取自定义目录。"
-          if [[ -n "$custom_target" ]]; then
-            TARGET_ARGUMENT="$custom_target"
-            return
-          fi
-          printf '自定义目录不能为空。\n' >&3
-        done
-        ;;
-      *)
-        printf '请输入 1、2、3，或直接按回车选择用户级。\n' >&3
-        ;;
-    esac
-  done
+  case "$MENU_CURSOR" in
+    0)
+      TARGET_ARGUMENT=".agents"
+      ;;
+    1)
+      TARGET_ARGUMENT="${HOME%/}/.agents"
+      ;;
+    *)
+      while true; do
+        printf '请输入 Agent 配置根目录：' >&3
+        IFS= read -r custom_target <&3 || fail "未能读取自定义目录。"
+        if [[ -n "$custom_target" ]]; then
+          TARGET_ARGUMENT="$custom_target"
+          return
+        fi
+        printf '自定义目录不能为空。\n' >&3
+      done
+      ;;
+  esac
 }
 
 # --target 表示 Agent 配置根目录；所有 Skill 都安装到该目录下的 skills/。
@@ -208,7 +323,7 @@ resolve_installation_directories() {
 
   case "$TARGET_ARGUMENT" in
     "")
-      AGENT_CONFIG_DIRECTORY="${normalized_home}/.agents"
+      AGENT_CONFIG_DIRECTORY="${INVOCATION_DIRECTORY%/}/.agents"
       ;;
     "~")
       AGENT_CONFIG_DIRECTORY="$normalized_home"
@@ -235,66 +350,17 @@ resolve_installation_directories() {
   SKILLS_DIRECTORY="${AGENT_CONFIG_DIRECTORY}/skills"
 }
 
+# 目标路径若已存在但不是目录，直接失败，避免后续 mkdir -p / cp -R 出现歧义行为。
 validate_installation_target() {
-  local obsolete_skill_name=""
-  local obsolete_skill_directory=""
-
   if [[ -e "$AGENT_CONFIG_DIRECTORY" && ! -d "$AGENT_CONFIG_DIRECTORY" ]]; then
     fail "Agent 配置根目录已存在但不是目录：${AGENT_CONFIG_DIRECTORY}。"
   fi
   if [[ -e "$SKILLS_DIRECTORY" && ! -d "$SKILLS_DIRECTORY" ]]; then
     fail "Skills 目标已存在但不是目录：${SKILLS_DIRECTORY}。"
   fi
-  if [[ -d "$SKILLS_DIRECTORY" ]]; then
-    while IFS= read -r -d '' obsolete_skill_directory; do
-      [[ -d "$obsolete_skill_directory" || -L "$obsolete_skill_directory" ]] || continue
-      obsolete_skill_name="${obsolete_skill_directory##*/}"
-      if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-        OBSOLETE_SKILLS_TO_REMOVE="${OBSOLETE_SKILLS_TO_REMOVE}
-${obsolete_skill_name}"
-      else
-        OBSOLETE_SKILLS_TO_REMOVE="$obsolete_skill_name"
-      fi
-    done < <(find "$SKILLS_DIRECTORY" -mindepth 1 -maxdepth 1 \
-      -name "${OBSOLETE_SKILL_PREFIX}*" -print0)
-
-    if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-      OBSOLETE_SKILLS_TO_REMOVE="$(printf '%s\n' "$OBSOLETE_SKILLS_TO_REMOVE" | sort -u)"
-      OBSOLETE_SKILL_COUNT="$(printf '%s\n' "$OBSOLETE_SKILLS_TO_REMOVE" | grep -c . || true)"
-    fi
-  fi
 }
 
-# 仅清除归档不再提供的团队 Skill，避免更新同名 Skill 后又删除刚安装的目录。
-exclude_installed_skills_from_cleanup() {
-  local obsolete_skill_name=""
-  local remaining_obsolete_skills=""
-
-  [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]] || return 0
-
-  while IFS= read -r obsolete_skill_name; do
-    [[ -n "$obsolete_skill_name" ]] || continue
-    if [[ -d "${EXTRACTED_DIRECTORY}/skills/${obsolete_skill_name}" ]]; then
-      continue
-    fi
-
-    if [[ -n "$remaining_obsolete_skills" ]]; then
-      remaining_obsolete_skills="${remaining_obsolete_skills}
-${obsolete_skill_name}"
-    else
-      remaining_obsolete_skills="$obsolete_skill_name"
-    fi
-  done <<EOF
-$OBSOLETE_SKILLS_TO_REMOVE
-EOF
-
-  OBSOLETE_SKILLS_TO_REMOVE="$remaining_obsolete_skills"
-  OBSOLETE_SKILL_COUNT=0
-  if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-    OBSOLETE_SKILL_COUNT="$(printf '%s\n' "$OBSOLETE_SKILLS_TO_REMOVE" | grep -c . || true)"
-  fi
-}
-
+# 在独占的 mktemp 临时目录下预先规划归档、清单与解压目录路径，供后续下载与校验函数使用。
 prepare_work_directory() {
   local temp_root="${TMPDIR:-/tmp}"
 
@@ -336,6 +402,7 @@ validate_and_extract_archive() {
   fi
   [[ -s "$ARCHIVE_MANIFEST_FILE" ]] || fail "Source code 归档没有任何内容。"
 
+  # 路径以 / 开头或包含 ../ 视为越界，防止归档条目在解压时跳出临时目录（类似 zip slip）。
   if awk '
     /^\// || /(^|\/)\.\.(\/|$)/ { unsafe = 1 }
     END { exit unsafe ? 0 : 1 }
@@ -343,6 +410,8 @@ validate_and_extract_archive() {
     fail "Source code 归档包含越出资源根的路径。"
   fi
 
+  # GitHub 生成的归档顶层目录名包含仓库名与分支/commit 信息，无法预先硬编码，
+  # 这里从清单动态推导，且只接受单一顶层目录。
   ARCHIVE_ROOT_DIRECTORY="$(awk -F/ '
     NF > 0 && $1 != "" { roots[$1] = 1 }
     END {
@@ -367,47 +436,381 @@ validate_and_extract_archive() {
     fail "Source code 归档包含不允许安装的符号链接。"
 
   local source_skill=""
-  local resource_directory=""
-  local resource_file_count=0
   local skill_name=""
-  SKILL_COUNT=0
-  RESOURCE_FILE_COUNT=0
-  INSTALLED_SKILLS=""
+  local archive_skill_count=0
+  ARCHIVE_SKILLS=""
   while IFS= read -r -d '' source_skill; do
     [[ -d "$source_skill" ]] ||
       fail "skills/ 只能包含一级 Skill 目录：${source_skill##*/}。"
     [[ -f "${source_skill}/SKILL.md" ]] ||
       fail "Skill 目录缺少 SKILL.md：${source_skill##*/}。"
-    SKILL_COUNT=$((SKILL_COUNT + 1))
-    RESOURCE_FILE_COUNT=$((RESOURCE_FILE_COUNT + 1))
-
     skill_name="${source_skill##*/}"
-    if [[ -n "$INSTALLED_SKILLS" ]]; then
-      INSTALLED_SKILLS="${INSTALLED_SKILLS}
-${skill_name}"
-    else
-      INSTALLED_SKILLS="$skill_name"
-    fi
-
-    for resource_directory in agents references scripts assets; do
-      [[ -d "${source_skill}/${resource_directory}" ]] || continue
-      resource_file_count="$(find "${source_skill}/${resource_directory}" -type f |
-        wc -l | tr -d '[:space:]')"
-      RESOURCE_FILE_COUNT=$((RESOURCE_FILE_COUNT + resource_file_count))
-    done
+    ARCHIVE_SKILLS="${ARCHIVE_SKILLS}${skill_name}
+"
+    archive_skill_count=$((archive_skill_count + 1))
   done < <(find "${EXTRACTED_DIRECTORY}/skills" -mindepth 1 -maxdepth 1 -print0)
 
-  if [[ -n "$INSTALLED_SKILLS" ]]; then
-    INSTALLED_SKILLS="$(printf '%s\n' "$INSTALLED_SKILLS" | sort -u)"
-  fi
-
-  ((SKILL_COUNT > 0)) || fail "Source code 中没有可安装的 Skill。"
-  exclude_installed_skills_from_cleanup
+  ((archive_skill_count > 0)) || fail "Source code 中没有可安装的 Skill。"
+  ARCHIVE_SKILLS="$(printf '%s' "$ARCHIVE_SKILLS" | sort -u)"
 }
 
+# 组合名称和组合内容全部来自归档 profiles/，脚本不硬编码任何组合名或 Skill 名。
+load_profiles() {
+  local profile_file=""
+  local profile_name=""
+  local profile_description=""
+
+  PROFILES_DIRECTORY="${EXTRACTED_DIRECTORY}/profiles"
+  [[ -d "$PROFILES_DIRECTORY" ]] || return 0
+
+  for profile_file in "$PROFILES_DIRECTORY"/*.list; do
+    [[ -f "$profile_file" ]] || continue
+    profile_name="${profile_file##*/}"
+    profile_name="${profile_name%.list}"
+    profile_description="$(awk '
+      NR == 1 && /^#/ { sub(/^#[[:space:]]*/, ""); print; exit }
+    ' "$profile_file")"
+    [[ -n "$profile_description" ]] || profile_description="$profile_name"
+
+    PROFILE_NAMES[PROFILE_TOTAL]="$profile_name"
+    PROFILE_LABELS[PROFILE_TOTAL]="$profile_description"
+    PROFILE_MARKS[PROFILE_TOTAL]=0
+    PROFILE_TOTAL=$((PROFILE_TOTAL + 1))
+  done
+
+  ((PROFILE_TOTAL > 0)) || fail "profiles/ 中没有可用的安装组合。"
+}
+
+# 线性查找组合名是否已加载，供 --profile 校验未知组合名使用。
+profile_exists() {
+  local wanted="$1"
+  local index=0
+
+  while ((index < PROFILE_TOTAL)); do
+    if [[ "${PROFILE_NAMES[index]}" == "$wanted" ]]; then
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  return 1
+}
+
+# 输出全部可用组合名，供 --profile 传入未知组合时的错误提示引用。
+list_available_profile_names() {
+  local index=0
+
+  while ((index < PROFILE_TOTAL)); do
+    printf '  %s\n' "${PROFILE_NAMES[index]}"
+    index=$((index + 1))
+  done
+}
+
+# 带去重地追加组合名；交互勾选与 --profile 解析都经过这里，保证两条路径的去重语义一致。
+append_selected_profile() {
+  local profile_name="$1"
+
+  case "
+${SELECTED_PROFILES}" in
+    *"
+${profile_name}
+"*) return 0 ;;
+  esac
+  SELECTED_PROFILES="${SELECTED_PROFILES}${profile_name}
+"
+}
+
+# 组合勾选菜单的一次性绘制，含每项的勾选状态标记，渲染行数计入 PICKER_RENDERED_LINES 供重绘使用。
+render_profile_picker() {
+  local index=0
+  local marker=""
+  local pointer=""
+
+  printf '请勾选要安装的 Skill 组合\n' >&3
+  printf '  ↑↓ 或 j/k 移动，空格选择/取消，a 全选，n 全清，回车确认，q 取消\n\n' >&3
+  PICKER_RENDERED_LINES=3
+
+  while ((index < PROFILE_TOTAL)); do
+    if ((PROFILE_MARKS[index] == 1)); then
+      marker="x"
+    else
+      marker=" "
+    fi
+    if ((index == PICKER_CURSOR)); then
+      pointer=">"
+    else
+      pointer=" "
+    fi
+    printf '  %s [%s] %-12s %s\n' \
+      "$pointer" "$marker" "${PROFILE_NAMES[index]}" "${PROFILE_LABELS[index]}" >&3
+    PICKER_RENDERED_LINES=$((PICKER_RENDERED_LINES + 1))
+    index=$((index + 1))
+  done
+}
+
+# 方向键的转义序列超时交给终端驱动的 min/time，不依赖 bash 4 才有的小数 read -t。
+read_picker_key() {
+  local first=""
+  local second=""
+  local third=""
+
+  PICKER_KEY="other"
+  IFS= read -r -s -n 1 first <&3 || {
+    PICKER_KEY="enter"
+    return 0
+  }
+
+  case "$first" in
+    "")
+      PICKER_KEY="enter"
+      return 0
+      ;;
+    " ")
+      PICKER_KEY="space"
+      return 0
+      ;;
+    j | J)
+      PICKER_KEY="down"
+      return 0
+      ;;
+    k | K)
+      PICKER_KEY="up"
+      return 0
+      ;;
+    a | A)
+      PICKER_KEY="all"
+      return 0
+      ;;
+    n | N)
+      PICKER_KEY="none"
+      return 0
+      ;;
+    q | Q)
+      PICKER_KEY="quit"
+      return 0
+      ;;
+    $'\e') ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  stty min 0 time 1 <&3
+  IFS= read -r -s -n 1 second <&3 || second=""
+  IFS= read -r -s -n 1 third <&3 || third=""
+  stty min 1 time 0 <&3
+
+  if [[ "$second" == "[" ]]; then
+    case "$third" in
+      A) PICKER_KEY="up" ;;
+      B) PICKER_KEY="down" ;;
+    esac
+  fi
+}
+
+# 批量设置全部组合的勾选状态，供全选（a）/全清（n）按键复用。
+set_all_profile_marks() {
+  local mark="$1"
+  local index=0
+
+  while ((index < PROFILE_TOTAL)); do
+    PROFILE_MARKS[index]="$mark"
+    index=$((index + 1))
+  done
+}
+
+# 把当前勾选状态转换为 SELECTED_PROFILES；复用 append_selected_profile 保持去重语义。
+collect_selected_profiles_from_marks() {
+  local index=0
+
+  while ((index < PROFILE_TOTAL)); do
+    if ((PROFILE_MARKS[index] == 1)); then
+      append_selected_profile "${PROFILE_NAMES[index]}"
+    fi
+    index=$((index + 1))
+  done
+}
+
+# 组合勾选交互主循环；回车时若未勾选任何组合则继续循环，不允许提交空选择。
+pick_profiles_interactively() {
+  TERMINAL_STATE_SAVED="$(stty -g <&3)" ||
+    fail "无法读取终端属性，请改用 --profile <组合名单>。"
+  stty -icanon -echo min 1 time 0 <&3 ||
+    fail "无法进入终端原始模式，请改用 --profile <组合名单>。"
+
+  PICKER_CURSOR=0
+  PICKER_RENDERED_LINES=0
+  while true; do
+    if ((PICKER_RENDERED_LINES > 0)); then
+      printf '\033[%dA\033[J' "$PICKER_RENDERED_LINES" >&3
+    fi
+    render_profile_picker
+    read_picker_key
+
+    case "$PICKER_KEY" in
+      up)
+        if ((PICKER_CURSOR > 0)); then
+          PICKER_CURSOR=$((PICKER_CURSOR - 1))
+        fi
+        ;;
+      down)
+        if ((PICKER_CURSOR < PROFILE_TOTAL - 1)); then
+          PICKER_CURSOR=$((PICKER_CURSOR + 1))
+        fi
+        ;;
+      space)
+        if ((PROFILE_MARKS[PICKER_CURSOR] == 1)); then
+          PROFILE_MARKS[PICKER_CURSOR]=0
+        else
+          PROFILE_MARKS[PICKER_CURSOR]=1
+        fi
+        ;;
+      all)
+        set_all_profile_marks 1
+        ;;
+      none)
+        set_all_profile_marks 0
+        ;;
+      enter)
+        collect_selected_profiles_from_marks
+        if [[ -n "$SELECTED_PROFILES" ]]; then
+          restore_terminal_state
+          printf '\n' >&3
+          return 0
+        fi
+        ;;
+      quit)
+        restore_terminal_state
+        printf '\n已取消。\n' >&3
+        exit 0
+        ;;
+    esac
+  done
+}
+
+# 解析 --profile 的逗号分隔名单；遇到未知组合立即失败并列出全部可用组合，不做模糊匹配。
+resolve_profile_argument() {
+  local remaining="$PROFILE_ARGUMENT"
+  local profile_name=""
+
+  while [[ -n "$remaining" ]]; do
+    profile_name="${remaining%%,*}"
+    if [[ "$profile_name" == "$remaining" ]]; then
+      remaining=""
+    else
+      remaining="${remaining#*,}"
+    fi
+    [[ -n "$profile_name" ]] || continue
+    if ! profile_exists "$profile_name"; then
+      fail "未知组合：${profile_name}。可用组合：
+$(list_available_profile_names)"
+    fi
+    append_selected_profile "$profile_name"
+  done
+
+  [[ -n "$SELECTED_PROFILES" ]] || fail "--profile 没有解析出任何组合。"
+}
+
+# 把已选组合展开为具体 Skill 名单；多个组合共享的 Skill 靠 sort -u 去重，不在此处手动判重。
+expand_selected_profiles() {
+  local profile_name=""
+  local profile_file=""
+  local skill_name=""
+
+  while IFS= read -r profile_name; do
+    [[ -n "$profile_name" ]] || continue
+    profile_file="${PROFILES_DIRECTORY}/${profile_name}.list"
+    [[ -f "$profile_file" ]] || fail "无法定位组合清单：${profile_name}.list。"
+    while IFS= read -r skill_name; do
+      case "$skill_name" in "" | \#*) continue ;; esac
+      SELECTED_SKILLS="${SELECTED_SKILLS}${skill_name}
+"
+    done <"$profile_file"
+  done <<EOF
+$SELECTED_PROFILES
+EOF
+
+  SELECTED_SKILLS="$(printf '%s' "$SELECTED_SKILLS" | sort -u)"
+}
+
+# 组合清单由 web-skills 维护；与归档 skills/ 不同步时立即失败，不静默跳过。
+validate_selected_skills() {
+  local skill_name=""
+
+  SKILL_COUNT=0
+  while IFS= read -r skill_name; do
+    [[ -n "$skill_name" ]] || continue
+    [[ -d "${EXTRACTED_DIRECTORY}/skills/${skill_name}" ]] ||
+      fail "组合清单引用了归档中不存在的 Skill：${skill_name}。"
+    SKILL_COUNT=$((SKILL_COUNT + 1))
+  done <<EOF
+$SELECTED_SKILLS
+EOF
+
+  ((SKILL_COUNT > 0)) || fail "选定组合没有解析出任何 Skill。"
+}
+
+# 只在 --verbose 时统计已选 Skill 下的资源文件数，避免非 verbose 路径承担多余的 find 开销。
+count_selected_resources() {
+  local skill_name=""
+  local file_count=0
+
+  RESOURCE_FILE_COUNT=0
+  while IFS= read -r skill_name; do
+    [[ -n "$skill_name" ]] || continue
+    file_count="$(find "${EXTRACTED_DIRECTORY}/skills/${skill_name}" -type f |
+      wc -l | tr -d '[:space:]')"
+    RESOURCE_FILE_COUNT=$((RESOURCE_FILE_COUNT + file_count))
+  done <<EOF
+$SELECTED_SKILLS
+EOF
+}
+
+# 汇总四条取值路径的优先级：--profile 显式指定 > 归档未提供 profiles/ 时全装 > 交互勾选 > --force 且未指定 --profile 时全装。
+resolve_selected_skills() {
+  if [[ -n "$PROFILE_ARGUMENT" ]]; then
+    ((PROFILE_TOTAL > 0)) ||
+      fail "Source code 归档没有提供 profiles/，无法使用 --profile。"
+    resolve_profile_argument
+  elif ((PROFILE_TOTAL == 0)); then
+    printf '提示：Source code 归档没有提供 profiles/，本次安装全部 Skill。\n'
+    SELECTED_SKILLS="$ARCHIVE_SKILLS"
+  elif [[ "$INTERACTIVE_TERMINAL_OPEN" == true && "$FORCE_INSTALL" != true ]]; then
+    pick_profiles_interactively
+  else
+    SELECTED_SKILLS="$ARCHIVE_SKILLS"
+  fi
+
+  if [[ -n "$SELECTED_PROFILES" ]]; then
+    expand_selected_profiles
+  fi
+  validate_selected_skills
+}
+
+# 把已选组合名拼成一行摘要；安装预览与安装完成摘要共用同一个函数，避免文案分叉。
+print_selected_profiles() {
+  local output_fd="$1"
+  local profile_name=""
+  local joined=""
+
+  while IFS= read -r profile_name; do
+    [[ -n "$profile_name" ]] || continue
+    if [[ -n "$joined" ]]; then
+      joined="${joined}、${profile_name}"
+    else
+      joined="$profile_name"
+    fi
+  done <<EOF
+$SELECTED_PROFILES
+EOF
+
+  [[ -n "$joined" ]] || return 0
+  printf '  安装组合：%s\n' "$joined" >&"$output_fd"
+}
+
+# 安装前的详细预览；仅当 --force 且未加 --verbose 时，main() 才会跳过调用直接确认。
 print_installation_preview() {
   local output_fd=1
-  local obsolete_skill_name=""
+  local skill_name=""
 
   [[ "$INTERACTIVE_TERMINAL_OPEN" == true ]] && output_fd=3
   printf '\n即将安装 Web Skills：\n' >&"$output_fd"
@@ -415,40 +818,33 @@ print_installation_preview() {
   if [[ "$VERBOSE" == true ]]; then
     printf '  Source code：tar.gz，%s 字节\n' "$ARCHIVE_SIZE_BYTES" >&"$output_fd"
   fi
+  print_selected_profiles "$output_fd"
   printf '  Skill 数量：%s\n' "$SKILL_COUNT" >&"$output_fd"
   if [[ "$VERBOSE" == true ]]; then
+    count_selected_resources
     printf '  资源文件：%s\n' "$RESOURCE_FILE_COUNT" >&"$output_fd"
   fi
   printf '  Agent 配置根：%s\n' "$AGENT_CONFIG_DIRECTORY" >&"$output_fd"
   printf '  Skills 目录：%s\n' "$SKILLS_DIRECTORY" >&"$output_fd"
-  if [[ "$VERBOSE" == true ]]; then
-    printf '  更新方式：增量覆盖；保留额外 Skill、plugins/ 和其他 Agent 配置\n' >&"$output_fd"
-  fi
-  if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-    if [[ "$VERBOSE" == true ]]; then
-      printf '  清除旧 Skill：\n' >&"$output_fd"
-      while IFS= read -r obsolete_skill_name; do
-        [[ -n "$obsolete_skill_name" ]] || continue
-        printf '    - %s/%s\n' "$SKILLS_DIRECTORY" "$obsolete_skill_name" >&"$output_fd"
-      done <<EOF
-$OBSOLETE_SKILLS_TO_REMOVE
+  printf '  载入 Skill：\n' >&"$output_fd"
+  while IFS= read -r skill_name; do
+    [[ -n "$skill_name" ]] || continue
+    printf '    - %s\n' "$skill_name" >&"$output_fd"
+  done <<EOF
+$SELECTED_SKILLS
 EOF
-    else
-      printf '  清除旧 Skill：%s 个\n' "$OBSOLETE_SKILL_COUNT" >&"$output_fd"
-    fi
+  if [[ "$VERBOSE" == true ]]; then
+    printf '  安装方式：名单内的 Skill 目录整目录替换；名单之外的目录不做处理\n' >&"$output_fd"
   fi
 }
 
+# --force 时跳过二次确认；否则只有显式输入 n/no 才会取消，其余输入（含直接回车）一律视为继续。
 confirm_installation() {
   local answer=""
 
   [[ "$FORCE_INSTALL" == true ]] && return
   while true; do
-    if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-      printf '\n按回车安装并清除以上旧 Skill，输入 n 取消：' >&3
-    else
-      printf '\n按回车继续，输入 n 取消：' >&3
-    fi
+    printf '\n按回车继续，输入 n 取消：' >&3
     IFS= read -r answer <&3 || fail "未能读取用户输入。"
     case "$answer" in
       "" | y | Y | yes | YES)
@@ -465,84 +861,56 @@ confirm_installation() {
   done
 }
 
-# 先发布并验证归档中的全部 Skills，最后才定向移除旧 Skill。
+# 名单内的 Skill 目录名归 web-skills 所有：先移除同名条目再整目录写入，
+# 避免上游已删除的资源在目标位置长期残留。
 install_skills() {
+  local skill_name=""
   local source_skill=""
   local target_skill=""
-  local resource_directory=""
-  local obsolete_skill_name=""
-  local obsolete_skill_directory=""
 
   mkdir -p "$SKILLS_DIRECTORY"
   [[ -w "$SKILLS_DIRECTORY" ]] || fail "Skills 目录不可写：${SKILLS_DIRECTORY}。"
 
-  while IFS= read -r -d '' source_skill; do
-    target_skill="${SKILLS_DIRECTORY}/${source_skill##*/}"
-    mkdir -p "$target_skill"
-    cp "${source_skill}/SKILL.md" "${target_skill}/SKILL.md"
-
-    for resource_directory in agents references scripts assets; do
-      [[ -d "${source_skill}/${resource_directory}" ]] || continue
-      cp -R "${source_skill}/${resource_directory}" "${target_skill}/"
-    done
-  done < <(find "${EXTRACTED_DIRECTORY}/skills" -mindepth 1 -maxdepth 1 -type d -print0)
-
-  while IFS= read -r -d '' source_skill; do
-    target_skill="${SKILLS_DIRECTORY}/${source_skill##*/}"
+  while IFS= read -r skill_name; do
+    [[ -n "$skill_name" ]] || continue
+    source_skill="${EXTRACTED_DIRECTORY}/skills/${skill_name}"
+    target_skill="${SKILLS_DIRECTORY}/${skill_name}"
+    # 先移除同名目标再校验确已不存在，避免遗留的软链接或特殊文件让后续 cp -R 产生歧义。
+    rm -rf -- "$target_skill"
+    [[ ! -e "$target_skill" && ! -L "$target_skill" ]] ||
+      fail "无法替换已存在的目标：${target_skill}。"
+    cp -R "$source_skill" "$target_skill"
     [[ -f "${target_skill}/SKILL.md" ]] ||
-      fail "安装后缺少 ${source_skill##*/}。"
-  done < <(find "${EXTRACTED_DIRECTORY}/skills" -mindepth 1 -maxdepth 1 -type d -print0)
-
-  if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-    while IFS= read -r obsolete_skill_name; do
-      [[ -n "$obsolete_skill_name" ]] || continue
-      obsolete_skill_directory="${SKILLS_DIRECTORY}/${obsolete_skill_name}"
-      rm -rf -- "$obsolete_skill_directory"
-      [[ ! -e "$obsolete_skill_directory" && ! -L "$obsolete_skill_directory" ]] ||
-        fail "无法清除旧 Skill：${obsolete_skill_directory}。"
-    done <<EOF
-$OBSOLETE_SKILLS_TO_REMOVE
+      fail "安装后缺少 ${skill_name}。"
+  done <<EOF
+$SELECTED_SKILLS
 EOF
-  fi
 }
 
+# 安装完成后的摘要；字段与 print_installation_preview 基本对称，便于核对预览与实际安装结果是否一致。
 print_summary() {
   local skill_name=""
-  local obsolete_skill_name=""
 
   printf '\nWeb Skills 安装完成。\n'
   printf '  GitHub 来源：%s@%s\n' "$GITHUB_REPOSITORY" "$GITHUB_BRANCH"
   printf '  Agent 配置根：%s\n' "$AGENT_CONFIG_DIRECTORY"
   printf '  Skills 目录：%s\n' "$SKILLS_DIRECTORY"
+  print_selected_profiles 1
   printf '  Skill 数量：%s\n' "$SKILL_COUNT"
 
   if [[ "$VERBOSE" == true ]]; then
-    if [[ -n "$INSTALLED_SKILLS" ]]; then
-      printf '  已安装 Skill：\n'
-      while IFS= read -r skill_name; do
-        [[ -n "$skill_name" ]] || continue
-        printf '    - %s\n' "$skill_name"
-      done <<EOF
-$INSTALLED_SKILLS
+    printf '  已安装 Skill：\n'
+    while IFS= read -r skill_name; do
+      [[ -n "$skill_name" ]] || continue
+      printf '    - %s\n' "$skill_name"
+    done <<EOF
+$SELECTED_SKILLS
 EOF
-    fi
-    if [[ -n "$OBSOLETE_SKILLS_TO_REMOVE" ]]; then
-      printf '  已清除旧 Skill：\n'
-      while IFS= read -r obsolete_skill_name; do
-        [[ -n "$obsolete_skill_name" ]] || continue
-        printf '    - %s\n' "$obsolete_skill_name"
-      done <<EOF
-$OBSOLETE_SKILLS_TO_REMOVE
-EOF
-    fi
-  else
-    if (( OBSOLETE_SKILL_COUNT > 0 )); then
-      printf '  已清除旧 Skill：%s 个\n' "$OBSOLETE_SKILL_COUNT"
-    fi
   fi
   printf '\n重新启动对应 Agent 会话后即可加载最新 Skills。\n'
 }
 
+# 主流程：函数调用顺序即安装的完整生命周期；异常与正常退出统一交给顶部注册的 trap cleanup 处理。
 main() {
   parse_arguments "$@"
   validate_runtime_dependencies
@@ -553,6 +921,8 @@ main() {
   prepare_work_directory
   download_source_archive
   validate_and_extract_archive
+  load_profiles
+  resolve_selected_skills
   if [[ "$VERBOSE" == true || "$FORCE_INSTALL" != true ]]; then
     print_installation_preview
   fi
