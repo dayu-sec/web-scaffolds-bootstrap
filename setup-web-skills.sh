@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 
+# 脚本使用 bash 数组等特性；显式用其他 Shell 执行会绕过 shebang，提前给出明确提示。
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '错误：本脚本需要 bash 运行。请执行 bash setup-web-skills.sh，或 curl ... | bash。\n' >&2
+  exit 1
+fi
+
 set -Eeuo pipefail
 
 # Web Skills 通过公开 GitHub 仓库分发，无需 Token；默认取 main 分支，可用 --branch 指定其他分支。
 readonly GITHUB_REPOSITORY="dayu-sec/web-skills"
 readonly DEFAULT_GITHUB_BRANCH="main"
+# 交互界面的空转轮次上限：每轮为一次 1 秒读超时，约等于一小时无按键后放弃等待。
+readonly IDLE_ROUNDS_BEFORE_CANCEL=3600
 GITHUB_BRANCH="$DEFAULT_GITHUB_BRANCH"
 GITHUB_ARCHIVE_URL=""
 
@@ -28,6 +36,7 @@ PROFILES_DIRECTORY=""
 SELECTED_PROFILES=""
 SELECTED_SKILLS=""
 TERMINAL_STATE_SAVED=""
+PENDING_SIGNAL=""
 PICKER_KEY=""
 PICKER_CURSOR=0
 PICKER_RENDERED_LINES=0
@@ -67,7 +76,8 @@ print_usage() {
   或自定义 Agent 配置根目录；Skill 最终安装到所选目录下的 skills/。
 
 未指定 --profile 时：
-  在可交互终端下勾选安装组合；使用 --force 或无法交互时安装全部 Skill。
+  在可交互终端下勾选安装组合；使用 --force 时安装全部 Skill。
+  无法交互的环境必须同时指定 --target 与 --force。
 
 EOF
   print_installation_overview
@@ -111,6 +121,35 @@ enter_raw_mode() {
     fail "无法读取终端属性，请改用 --target 与 --profile 非交互执行。"
   stty -icanon -echo min 1 time 0 <&3 ||
     fail "无法进入终端原始模式，请改用 --target 与 --profile 非交互执行。"
+  PENDING_SIGNAL=""
+  trap 'note_pending_signal INT' INT
+  trap 'note_pending_signal TERM' TERM
+}
+
+# bash 的 read -n 会在读取前保存终端属性、退栈时写回，因此在信号处理函数里直接恢复
+# 会被它覆盖，终端最终停在无回显状态。交互期间只记录信号，等 read 返回、控制权回到
+# 脚本自身之后再恢复终端并退出。
+note_pending_signal() {
+  PENDING_SIGNAL="$1"
+}
+
+handle_pending_signal() {
+  local received="$PENDING_SIGNAL"
+
+  [[ -n "$received" ]] || return 0
+  PENDING_SIGNAL=""
+  leave_raw_mode
+  printf '\n已取消。\n' >&3
+  case "$received" in
+    INT) exit 130 ;;
+    *) exit 143 ;;
+  esac
+}
+
+leave_raw_mode() {
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  restore_terminal_state
 }
 
 # 只有真正保存过终端属性、且交互终端已打开时才尝试恢复，避免在非交互路径上误操作未打开的 fd 3。
@@ -127,6 +166,7 @@ cleanup() {
 
   trap - EXIT INT TERM
   set +e
+  PENDING_SIGNAL=""
   restore_terminal_state
   if [[ -n "$WORK_DIRECTORY" && -d "$WORK_DIRECTORY" ]]; then
     rm -rf -- "$WORK_DIRECTORY"
@@ -137,7 +177,9 @@ cleanup() {
   exit "$exit_code"
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # 只做参数解析与基础格式校验；路径、组合名等语义校验交给后续专职函数处理。
 parse_arguments() {
@@ -216,15 +258,14 @@ open_interactive_terminal() {
   INTERACTIVE_TERMINAL_OPEN=true
 }
 
-# 单选菜单的一次性绘制，记录渲染行数供上层用转义序列清屏重绘。
+# 只绘制选项行并记录行数供上层用转义序列回退重绘。
+# PICKER_RENDERED_LINES 统计的是换行符个数，而 \033[A 回退的是物理行，
+# 因此重绘区内不能出现长度不可控、可能被终端折行的内容——标题等一次性输出留在重绘区之外。
 render_single_choice_menu() {
-  local title="$1"
   local index=0
   local pointer=""
 
-  printf '%s\n' "$title" >&3
-  printf '  ↑↓ 或 j/k 移动，回车确认，q 取消\n\n' >&3
-  PICKER_RENDERED_LINES=3
+  PICKER_RENDERED_LINES=0
 
   while ((index < MENU_TOTAL)); do
     if ((index == MENU_CURSOR)); then
@@ -243,14 +284,17 @@ run_single_choice_menu() {
   local title="$1"
 
   enter_raw_mode
+  printf '\n%s\n' "$title" >&3
+  printf '  ↑↓ 或 j/k 移动，回车确认，q 取消\n\n' >&3
   MENU_CURSOR=0
   PICKER_RENDERED_LINES=0
   while true; do
     if ((PICKER_RENDERED_LINES > 0)); then
       printf '\033[%dA\033[J' "$PICKER_RENDERED_LINES" >&3
     fi
-    render_single_choice_menu "$title"
+    render_single_choice_menu
     read_picker_key
+    handle_pending_signal
 
     case "$PICKER_KEY" in
       up)
@@ -264,12 +308,12 @@ run_single_choice_menu() {
         fi
         ;;
       enter)
-        restore_terminal_state
+        leave_raw_mode
         printf '\n' >&3
         return 0
         ;;
       quit)
-        restore_terminal_state
+        leave_raw_mode
         printf '\n已取消。\n' >&3
         exit 0
         ;;
@@ -286,12 +330,14 @@ collect_interactive_target() {
   fi
 
   MENU_LABELS=(
-    "项目级：${INVOCATION_DIRECTORY%/}/.agents"
-    "用户级：${HOME%/}/.agents"
+    "项目级 ./.agents"
+    "用户级 ~/.agents"
     "自定义 Agent 配置根目录"
   )
   MENU_TOTAL=3
-  run_single_choice_menu "请选择 Web Skills 安装位置"
+  run_single_choice_menu "请选择 Web Skills 安装位置
+  项目级 ${INVOCATION_DIRECTORY%/}/.agents
+  用户级 ${HOME%/}/.agents"
 
   case "$MENU_CURSOR" in
     0)
@@ -525,9 +571,7 @@ render_profile_picker() {
   local marker=""
   local pointer=""
 
-  printf '请勾选要安装的 Skill 组合\n' >&3
-  printf '  ↑↓ 或 j/k 移动，空格选择/取消，a 全选，n 全清，回车确认，q 取消\n\n' >&3
-  PICKER_RENDERED_LINES=3
+  PICKER_RENDERED_LINES=0
 
   while ((index < PROFILE_TOTAL)); do
     if ((PROFILE_MARKS[index] == 1)); then
@@ -547,17 +591,32 @@ render_profile_picker() {
   done
 }
 
-# 方向键的转义序列超时交给终端驱动的 min/time，不依赖 bash 4 才有的小数 read -t。
+# read -n 期间由 bash 接管终端属性，stty 的 min/time 不生效，超时只能用 read -t，
+# 且 bash 3.2 的 -t 仅接受整数秒。轮询的目的不是等按键，而是让被 trap 记下的中断信号
+# 有机会被处理：trap 返回后 bash 会重启被打断的阻塞 read，不设超时就永远拿不回控制权。
 read_picker_key() {
   local first=""
   local second=""
   local third=""
+  local read_status=0
+  local idle_rounds=0
 
   PICKER_KEY="other"
-  IFS= read -r -s -n 1 first <&3 || {
-    PICKER_KEY="enter"
-    return 0
-  }
+  while true; do
+    read_status=0
+    IFS= read -r -s -n 1 -t 1 first <&3 || read_status=$?
+    if ((read_status == 0)); then
+      break
+    fi
+    handle_pending_signal
+    # bash 3.2 的超时返回 1，与 EOF 同码，无法按退出码区分；改用连续空转轮次兜底，
+    # 正常静置只是继续等待，终端异常导致的立即失败会在很短时间内耗尽轮次。
+    idle_rounds=$((idle_rounds + 1))
+    if ((idle_rounds >= IDLE_ROUNDS_BEFORE_CANCEL)); then
+      PICKER_KEY="quit"
+      return 0
+    fi
+  done
 
   case "$first" in
     "")
@@ -594,17 +653,20 @@ read_picker_key() {
       ;;
   esac
 
-  stty min 0 time 1 <&3
-  IFS= read -r -s -n 1 second <&3 || second=""
-  IFS= read -r -s -n 1 third <&3 || third=""
-  stty min 1 time 0 <&3
+  # 裸 ESC 不是绑定键：只在读到 CSI（[）或 SS3（O）引导符时才继续读第三个字节，
+  # 否则立即返回，避免多等一轮超时并多吞一个按键。SS3 序列出现在 tmux/screen 的
+  # 光标应用模式下，方向键为 \eOA / \eOB。
+  IFS= read -r -s -n 1 -t 1 second <&3 || second=""
+  case "$second" in
+    "[" | O) ;;
+    *) return 0 ;;
+  esac
 
-  if [[ "$second" == "[" ]]; then
-    case "$third" in
-      A) PICKER_KEY="up" ;;
-      B) PICKER_KEY="down" ;;
-    esac
-  fi
+  IFS= read -r -s -n 1 -t 1 third <&3 || third=""
+  case "$third" in
+    A) PICKER_KEY="up" ;;
+    B) PICKER_KEY="down" ;;
+  esac
 }
 
 # 批量设置全部组合的勾选状态，供全选（a）/全清（n）按键复用。
@@ -632,10 +694,9 @@ collect_selected_profiles_from_marks() {
 
 # 组合勾选交互主循环；回车时若未勾选任何组合则继续循环，不允许提交空选择。
 pick_profiles_interactively() {
-  TERMINAL_STATE_SAVED="$(stty -g <&3)" ||
-    fail "无法读取终端属性，请改用 --profile <组合名单>。"
-  stty -icanon -echo min 1 time 0 <&3 ||
-    fail "无法进入终端原始模式，请改用 --profile <组合名单>。"
+  enter_raw_mode
+  printf '\n请勾选要安装的 Skill 组合\n' >&3
+  printf '  ↑↓ 或 j/k 移动，空格选择/取消，a 全选，n 全清，回车确认，q 取消\n\n' >&3
 
   PICKER_CURSOR=0
   PICKER_RENDERED_LINES=0
@@ -645,6 +706,7 @@ pick_profiles_interactively() {
     fi
     render_profile_picker
     read_picker_key
+    handle_pending_signal
 
     case "$PICKER_KEY" in
       up)
@@ -673,13 +735,13 @@ pick_profiles_interactively() {
       enter)
         collect_selected_profiles_from_marks
         if [[ -n "$SELECTED_PROFILES" ]]; then
-          restore_terminal_state
+          leave_raw_mode
           printf '\n' >&3
           return 0
         fi
         ;;
       quit)
-        restore_terminal_state
+        leave_raw_mode
         printf '\n已取消。\n' >&3
         exit 0
         ;;
@@ -720,7 +782,8 @@ expand_selected_profiles() {
     [[ -n "$profile_name" ]] || continue
     profile_file="${PROFILES_DIRECTORY}/${profile_name}.list"
     [[ -f "$profile_file" ]] || fail "无法定位组合清单：${profile_name}.list。"
-    while IFS= read -r skill_name; do
+    # 末行缺少换行符时 read 返回非零，需补判变量非空，否则最后一个 Skill 会被静默漏装。
+    while IFS= read -r skill_name || [[ -n "$skill_name" ]]; do
       case "$skill_name" in "" | \#*) continue ;; esac
       SELECTED_SKILLS="${SELECTED_SKILLS}${skill_name}
 "
@@ -739,6 +802,9 @@ validate_selected_skills() {
   SKILL_COUNT=0
   while IFS= read -r skill_name; do
     [[ -n "$skill_name" ]] || continue
+    case "$skill_name" in
+      */* | . | ..) fail "组合清单包含非法 Skill 名：${skill_name}。" ;;
+    esac
     [[ -d "${EXTRACTED_DIRECTORY}/skills/${skill_name}" ]] ||
       fail "组合清单引用了归档中不存在的 Skill：${skill_name}。"
     SKILL_COUNT=$((SKILL_COUNT + 1))
