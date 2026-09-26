@@ -287,3 +287,7 @@ blob-report/
 *.local
 *.local.*
 *.local/
+
+# Keep local configuration example files tracked
+!*.local*.example
+
